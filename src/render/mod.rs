@@ -9,12 +9,11 @@ use bevy::core_pipeline::core_3d::{main_opaque_pass_3d, main_transparent_pass_3d
 use bevy::core_pipeline::{Core3d, Core3dSystems};
 use bevy::ecs::system::ResMut;
 use bevy::math::{Mat4, Vec3, Vec4};
+use bevy::pbr::MeshPipelineSystems;
 use bevy::prelude::*;
-use bevy::render::renderer::RenderQueue;
 use bevy::render::{Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems};
 
 use crate::HairGroom;
-use crate::env::{Probe, studio_probe};
 use crate::mesh::HairMesh;
 
 use pass::{GpuGroom, HairPassState};
@@ -31,7 +30,10 @@ impl Plugin for HairPlugin {
         render_app
             .init_resource::<ExtractedFrame>()
             .init_resource::<HairPassState>()
-            .add_systems(RenderStartup, pipeline::init_pipelines)
+            .add_systems(
+                RenderStartup,
+                pipeline::init_pipelines.after(MeshPipelineSystems),
+            )
             .add_systems(ExtractSchedule, extract_hair)
             .add_systems(Render, prepare_gpu.in_set(RenderSystems::PrepareResources))
             .add_systems(
@@ -60,7 +62,7 @@ impl Plugin for HairPlugin {
 #[derive(Resource, Default)]
 pub(crate) struct ExtractedFrame {
     pub grooms: Vec<ExtractedGroom>,
-    pub lights: Vec<ExtractedLight>,
+    pub directionals: Vec<ExtractedDirectional>,
     meshes: HashMap<AssetId<HairMesh>, HairMesh>,
 }
 
@@ -78,19 +80,19 @@ pub(crate) struct ExtractedGroom {
     center_diameter: f32,
 }
 
-pub(crate) struct ExtractedLight {
-    position: Vec3,
-    color: Vec3,
+pub(crate) struct ExtractedDirectional {
+    direction_to_light: Vec3,
+    casts_shadows: bool,
 }
 
 fn extract_hair(
     grooms: Extract<Query<(&HairGroom, &GlobalTransform, Option<&Visibility>)>>,
-    lights: Extract<Query<(&PointLight, &GlobalTransform)>>,
+    lights: Extract<Query<(&DirectionalLight, &GlobalTransform)>>,
     meshes: Extract<Res<Assets<HairMesh>>>,
     mut extracted: ResMut<ExtractedFrame>,
 ) {
     extracted.grooms.clear();
-    extracted.lights.clear();
+    extracted.directionals.clear();
     for (groom, transform, visibility) in &grooms {
         if visibility.is_some_and(|visibility| *visibility == Visibility::Hidden) {
             continue;
@@ -116,14 +118,9 @@ fn extract_hair(
         });
     }
     for (light, transform) in &lights {
-        if extracted.lights.len() == 3 {
-            break;
-        }
-        let color = light.color.to_linear();
-        let scale = light.intensity / 80_000.0;
-        extracted.lights.push(ExtractedLight {
-            position: transform.translation(),
-            color: Vec3::new(color.red, color.green, color.blue) * scale,
+        extracted.directionals.push(ExtractedDirectional {
+            direction_to_light: transform.back().as_vec3(),
+            casts_shadows: light.shadow_maps_enabled,
         });
     }
 }
@@ -132,15 +129,7 @@ fn prepare_gpu(
     mut state: ResMut<HairPassState>,
     extracted: Res<ExtractedFrame>,
     device: Res<bevy::render::renderer::RenderDevice>,
-    queue: Res<RenderQueue>,
-    mut probe: Local<Option<Probe>>,
 ) {
-    let probe = probe.get_or_insert_with(studio_probe);
-    if state.frame.env.is_none() {
-        state.frame.env = Some(pass::upload_env(&device, probe));
-        state.frame.probe_sh = probe.sh;
-        state.frame.env_sizes = probe.mip_sizes;
-    }
     for groom in &extracted.grooms {
         if state.grooms.contains_key(&groom.asset) {
             continue;
@@ -150,7 +139,7 @@ fn prepare_gpu(
         };
         state
             .grooms
-            .insert(groom.asset, GpuGroom::upload(&device, &queue, mesh));
+            .insert(groom.asset, GpuGroom::upload(&device, mesh));
     }
 }
 

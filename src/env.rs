@@ -1,5 +1,5 @@
-//! Studio probe: 9-coefficient irradiance SH (Ramamoorthi & Hanrahan 2002)
-//! and a small prefiltered lat-long used as the single GGX lobe lookup.
+//! Procedural studio probe kept for unit tests.
+//! The renderer samples the camera's Bevy environment cubemaps instead.
 
 use bevy::math::{Vec2, Vec3};
 

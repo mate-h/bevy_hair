@@ -3,16 +3,18 @@ use std::collections::HashMap;
 use bevy::asset::AssetId;
 use bevy::ecs::system::SystemParam;
 use bevy::math::{Mat4, Vec3, Vec4};
+use bevy::pbr::{MeshPipelineViewLayoutKey, MeshViewBindGroup, ViewKeyCache};
 use bevy::prelude::*;
 use bevy::render::render_resource::*;
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery};
 use bevy::render::view::{ViewDepthTexture, ViewTarget};
 use bytemuck::{Pod, Zeroable};
 
-use crate::env::{ENV_MIPS, Probe};
 use crate::mesh::{HairMesh, LAYER_COUNT};
-use crate::render::pipeline::{HairPipelines, queue_composite};
-use crate::render::{ExtractedFrame, flag};
+use crate::render::pipeline::{
+    HAIR_PARAMS_SIZE, HairPipelines, HairShadePipeline, queue_composite,
+};
+use crate::render::{ExtractedDirectional, ExtractedFrame, flag};
 
 pub const DOM_SIZE: u32 = 512;
 
@@ -31,18 +33,12 @@ struct HairParams {
     albedo: [f32; 4],
     flags: [u32; 4],
     pass_mode: [u32; 4],
-    lights: [[f32; 4]; 3],
-    light_colors: [[f32; 4]; 3],
-    sh: [[f32; 4]; 9],
+    light_eye: [f32; 4],
     light_forward: [f32; 4],
     dom_info: [f32; 4],
-    env_mip0: [u32; 4],
-    env_mip1: [u32; 4],
-    env_mip2: [u32; 4],
-    env_mip3: [u32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<HairParams>() == 720);
+const _: () = assert!(std::mem::size_of::<HairParams>() == HAIR_PARAMS_SIZE as usize);
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -78,7 +74,7 @@ pub struct GpuGroom {
 }
 
 impl GpuGroom {
-    pub fn upload(device: &RenderDevice, _queue: &RenderQueue, mesh: &HairMesh) -> Self {
+    pub fn upload(device: &RenderDevice, mesh: &HairMesh) -> Self {
         let layers: Vec<GpuLayer> = mesh
             .corners
             .iter()
@@ -132,16 +128,11 @@ impl GpuGroom {
                 BufferKind::Storage,
             ),
             dom_indirect: zeros(device, "hair_dom_indirect", 16, BufferKind::Indirect),
-            camera_params: zeros(
-                device,
-                "hair_params",
-                std::mem::size_of::<HairParams>() as u64,
-                BufferKind::Uniform,
-            ),
+            camera_params: zeros(device, "hair_params", HAIR_PARAMS_SIZE, BufferKind::Uniform),
             dom_params: zeros(
                 device,
                 "hair_dom_params",
-                std::mem::size_of::<HairParams>() as u64,
+                HAIR_PARAMS_SIZE,
                 BufferKind::Uniform,
             ),
         }
@@ -182,24 +173,18 @@ fn zeros(device: &RenderDevice, label: &str, size: u64, kind: BufferKind) -> Buf
     })
 }
 
+#[derive(Default)]
 pub struct FrameGpu {
-    pub env: Option<Buffer>,
-    pub probe_sh: [Vec3; 9],
-    pub env_sizes: [(u32, u32); ENV_MIPS],
     pub targets: Option<ScreenTargets>,
     pub dummy_depth: Option<TextureView>,
+    shade_target: Option<ShadeTarget>,
 }
 
-impl Default for FrameGpu {
-    fn default() -> Self {
-        Self {
-            env: None,
-            probe_sh: [Vec3::ZERO; 9],
-            env_sizes: [(1, 1); ENV_MIPS],
-            targets: None,
-            dummy_depth: None,
-        }
-    }
+struct ShadeTarget {
+    width: u32,
+    height: u32,
+    _texture: Texture,
+    view: TextureView,
 }
 
 pub struct ScreenTargets {
@@ -224,17 +209,15 @@ pub struct HairPassState {
     composite_key: Option<(TextureFormat, TextureFormat)>,
 }
 
-pub fn upload_env(device: &RenderDevice, probe: &Probe) -> Buffer {
-    init_buffer(device, "hair_env", &probe.latlong)
-}
-
 #[derive(SystemParam)]
 pub(crate) struct HairPass<'w> {
     pipelines: Res<'w, HairPipelines>,
+    shade_pipeline: Res<'w, HairShadePipeline>,
     cache: Res<'w, PipelineCache>,
     queue: Res<'w, RenderQueue>,
     device: Res<'w, RenderDevice>,
     extracted: Res<'w, ExtractedFrame>,
+    view_keys: Res<'w, ViewKeyCache>,
 }
 
 pub fn hair_pass(
@@ -242,19 +225,31 @@ pub fn hair_pass(
         &bevy::render::view::ExtractedView,
         &ViewTarget,
         &ViewDepthTexture,
+        &MeshViewBindGroup,
     )>,
     mut ctx: RenderContext,
     hair: HairPass,
     mut state: ResMut<HairPassState>,
+    mut shade_pipelines: ResMut<SpecializedRenderPipelines<HairShadePipeline>>,
 ) {
     let HairPass {
         pipelines,
+        shade_pipeline,
         cache,
         queue,
         device,
         extracted,
+        view_keys,
     } = hair;
-    let (view, target, depth) = view.into_inner();
+    let (view, target, depth, mesh_view) = view.into_inner();
+    let Some(mesh_key) = view_keys.get(&view.retained_view_entity) else {
+        return;
+    };
+    let layout_key = MeshPipelineViewLayoutKey::from(*mesh_key);
+    let shade_id = shade_pipelines.specialize(&cache, &shade_pipeline, layout_key);
+    let Some(shade) = cache.get_render_pipeline(shade_id) else {
+        return;
+    };
     let Some(clear) = cache.get_compute_pipeline(pipelines.clear) else {
         return;
     };
@@ -270,9 +265,6 @@ pub fn hair_pass(
     let Some(raster) = cache.get_compute_pipeline(pipelines.raster) else {
         return;
     };
-    let Some(shade) = cache.get_compute_pipeline(pipelines.shade) else {
-        return;
-    };
     let Some(filter) = cache.get_compute_pipeline(pipelines.filter) else {
         return;
     };
@@ -284,7 +276,10 @@ pub fn hair_pass(
         return;
     }
     ensure_targets(&device, &mut state.frame, width, height);
+    ensure_shade_target(&device, &mut state.frame, width, height);
     ensure_dummy_depth(&device, &mut ctx, &mut state.frame);
+    let shade_view = state.frame.shade_target.as_ref().unwrap().view.clone();
+    let environment_map = layout_key.contains(MeshPipelineViewLayoutKey::ENVIRONMENT_MAP);
 
     let world_from_view = view.world_from_view.to_matrix();
     let camera_pos = world_from_view.transform_point3(Vec3::ZERO);
@@ -346,10 +341,12 @@ pub fn hair_pass(
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(pixels.div_ceil(256), 1, 1);
         }
-        let (light_eye, light_dir, light_clip, light_near, light_far) =
-            light_fit(gpu, &extracted.lights);
-        let center = (gpu.bounds_min + gpu.bounds_max) * 0.5;
-        let radius = (gpu.bounds_max - gpu.bounds_min).length().max(1.0) * 0.5;
+        let (light_eye, light_dir, light_clip, light_near, light_far) = light_fit(
+            gpu,
+            groom.world_from_model,
+            key_direction(&extracted.directionals),
+        );
+        let (center, radius) = world_extent(gpu, groom.world_from_model);
         let dist = camera_pos.distance(center).max(0.5);
         // 24-bit quantization stays precise across the whole view, so the range
         // only has to contain the groom. A tight near plane drops the front strands.
@@ -366,9 +363,6 @@ pub fn hair_pass(
             camera_forward: forward,
             screen: Vec4::new(width as f32, height as f32, cam_near, cam_far),
             groom,
-            lights: &extracted.lights,
-            sh: &state.frame.probe_sh,
-            sizes: &state.frame.env_sizes,
             light_forward: light_dir,
             dom_near: light_near,
             dom_far: light_far,
@@ -385,9 +379,6 @@ pub fn hair_pass(
             camera_forward: light_dir,
             screen: Vec4::new(DOM_SIZE as f32, DOM_SIZE as f32, light_near, light_far),
             groom,
-            lights: &extracted.lights,
-            sh: &state.frame.probe_sh,
-            sizes: &state.frame.env_sizes,
             light_forward: light_dir,
             dom_near: light_near,
             dom_far: light_far,
@@ -500,22 +491,20 @@ pub fn hair_pass(
             );
         }
 
-        let env = state.frame.env.as_ref().unwrap();
-        dispatch(
+        draw_shade(
             &mut ctx,
             &cache,
-            shade,
-            &pipelines.shade_layout,
-            BindGroupEntries::sequential((
-                gpu.camera_params.as_entire_binding(),
-                targets.center.as_entire_binding(),
-                targets.beta.as_entire_binding(),
-                targets.shaded.as_entire_binding(),
-                targets.shaded_depth.as_entire_binding(),
-                targets.dom.as_entire_binding(),
-                env.as_entire_binding(),
-            )),
-            (width.div_ceil(8), height.div_ceil(8), 1),
+            ShadeDraw {
+                pipeline: shade,
+                layout: &shade_pipeline.layout,
+                mesh_view,
+                environment_map,
+                shade_view: &shade_view,
+                buffers: ShadeBuffers {
+                    params: &gpu.camera_params,
+                    targets,
+                },
+            },
         );
 
         let (color, depth_buf) = if groom.filter {
@@ -574,9 +563,6 @@ struct ViewArgs<'a> {
     camera_forward: Vec3,
     screen: Vec4,
     groom: &'a crate::render::ExtractedGroom,
-    lights: &'a [crate::render::ExtractedLight],
-    sh: &'a [Vec3; 9],
-    sizes: &'a [(u32, u32); ENV_MIPS],
     light_forward: Vec3,
     dom_near: f32,
     dom_far: f32,
@@ -586,15 +572,6 @@ struct ViewArgs<'a> {
 }
 
 fn make_params(args: ViewArgs) -> HairParams {
-    let mut lights = [[0.0; 4]; 3];
-    let mut colors = [[0.0; 4]; 3];
-    for (i, light) in args.lights.iter().take(3).enumerate() {
-        lights[i] = light.position.extend(1.0).to_array();
-        colors[i] = light.color.extend(1.0).to_array();
-    }
-    lights[0] = args.light_eye.extend(1.0).to_array();
-    let sh = args.sh.map(|coeff| coeff.extend(0.0).to_array());
-    let mips = mip_words(args.sizes);
     HairParams {
         clip_from_world: args.clip_from_world.to_cols_array_2d(),
         world_from_clip: args.world_from_clip.to_cols_array_2d(),
@@ -618,9 +595,7 @@ fn make_params(args: ViewArgs) -> HairParams {
             flag(args.groom.deep_opacity),
         ],
         pass_mode: args.pass_mode,
-        lights,
-        light_colors: colors,
-        sh,
+        light_eye: args.light_eye.extend(1.0).to_array(),
         light_forward: args.light_forward.extend(0.0).to_array(),
         dom_info: [
             DOM_SIZE as f32,
@@ -628,56 +603,71 @@ fn make_params(args: ViewArgs) -> HairParams {
             args.dom_near,
             args.dom_far,
         ],
-        env_mip0: mips[0],
-        env_mip1: mips[1],
-        env_mip2: mips[2],
-        env_mip3: mips[3],
     }
 }
 
-fn mip_words(sizes: &[(u32, u32); ENV_MIPS]) -> [[u32; 4]; 4] {
-    let mut offset = 0u32;
-    let mut words = [[0u32; 4]; 4];
-    for i in 0..ENV_MIPS {
-        let (w, h) = sizes[i];
-        words[i] = [offset, w.max(1), h.max(1), 0];
-        offset += w.max(1) * h.max(1);
+fn key_direction(lights: &[ExtractedDirectional]) -> Vec3 {
+    lights
+        .iter()
+        .find(|light| light.casts_shadows)
+        .or_else(|| lights.first())
+        .map(|light| light.direction_to_light)
+        .unwrap_or_else(|| Vec3::new(0.35, 0.82, 0.45))
+        .normalize_or(Vec3::Y)
+}
+
+fn world_corners(gpu: &GpuGroom, world_from_model: Mat4) -> [Vec3; 8] {
+    let min = gpu.bounds_min;
+    let max = gpu.bounds_max;
+    let mut corners = [Vec3::ZERO; 8];
+    let mut index = 0;
+    for x in [min.x, max.x] {
+        for y in [min.y, max.y] {
+            for z in [min.z, max.z] {
+                corners[index] = world_from_model.transform_point3(Vec3::new(x, y, z));
+                index += 1;
+            }
+        }
     }
-    words
+    corners
+}
+
+fn world_extent(gpu: &GpuGroom, world_from_model: Mat4) -> (Vec3, f32) {
+    let corners = world_corners(gpu, world_from_model);
+    let center = corners.iter().copied().sum::<Vec3>() / corners.len() as f32;
+    let radius = corners
+        .iter()
+        .map(|corner| corner.distance(center))
+        .fold(1.0, f32::max);
+    (center, radius)
 }
 
 fn light_fit(
     gpu: &GpuGroom,
-    lights: &[crate::render::ExtractedLight],
+    world_from_model: Mat4,
+    direction_to_light: Vec3,
 ) -> (Vec3, Vec3, Mat4, f32, f32) {
-    let center = (gpu.bounds_min + gpu.bounds_max) * 0.5;
-    let extent = (gpu.bounds_max - gpu.bounds_min).max(Vec3::splat(1.0));
-    let radius = extent.length().max(1.0);
-    let eye = if let Some(light) = lights.first() {
-        light.position
-    } else {
-        center + Vec3::new(0.4, 1.0, 0.6).normalize() * radius
-    };
-    let dir = (center - eye).normalize_or(Vec3::NEG_Z);
+    let (center, radius) = world_extent(gpu, world_from_model);
+    let to_light = direction_to_light.normalize_or(Vec3::Y);
+    let forward = -to_light;
+    let eye = center + to_light * radius;
     let mut near = f32::MAX;
     let mut far = f32::MIN;
-    let min = gpu.bounds_min;
-    let max = gpu.bounds_max;
-    for x in [min.x, max.x] {
-        for y in [min.y, max.y] {
-            for z in [min.z, max.z] {
-                let d = (Vec3::new(x, y, z) - eye).dot(dir);
-                near = near.min(d);
-                far = far.max(d);
-            }
-        }
+    for corner in world_corners(gpu, world_from_model) {
+        let depth = (corner - eye).dot(forward);
+        near = near.min(depth);
+        far = far.max(depth);
     }
     near = (near - radius * 0.05).max(0.05);
     far = (far + radius * 0.05).max(near + 1.0);
-    let view = Mat4::look_at_rh(eye, eye + dir, Vec3::Y);
-    let half = radius;
-    let proj = Mat4::orthographic_rh(-half, half, -half, half, near, far);
-    (eye, dir, proj * view, near, far)
+    let up = if forward.dot(Vec3::Y).abs() > 0.95 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
+    let view = Mat4::look_at_rh(eye, eye + forward, up);
+    let proj = Mat4::orthographic_rh(-radius, radius, -radius, radius, near, far);
+    (eye, forward, proj * view, near, far)
 }
 
 fn depth_is_reverse(clip: Mat4, camera: Vec3, forward: Vec3) -> bool {
@@ -716,6 +706,37 @@ fn ensure_targets(device: &RenderDevice, frame: &mut FrameGpu, width: u32, heigh
             DOM_SIZE as u64 * DOM_SIZE as u64 * 4 * 4,
             BufferKind::Storage,
         ),
+    });
+}
+
+fn ensure_shade_target(device: &RenderDevice, frame: &mut FrameGpu, width: u32, height: u32) {
+    if frame
+        .shade_target
+        .as_ref()
+        .is_some_and(|target| target.width == width && target.height == height)
+    {
+        return;
+    }
+    let texture = device.create_texture(&TextureDescriptor {
+        label: Some("hair_shade_discard"),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba8Unorm,
+        usage: TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&TextureViewDescriptor::default());
+    frame.shade_target = Some(ShadeTarget {
+        width,
+        height,
+        _texture: texture,
+        view,
     });
 }
 
@@ -824,6 +845,71 @@ struct RasterBuffers<'a> {
     targets: &'a ScreenTargets,
     depth_view: &'a TextureView,
     indirect: &'a Buffer,
+}
+
+struct ShadeBuffers<'a> {
+    params: &'a Buffer,
+    targets: &'a ScreenTargets,
+}
+
+struct ShadeDraw<'a> {
+    pipeline: &'a RenderPipeline,
+    layout: &'a BindGroupLayoutDescriptor,
+    mesh_view: &'a MeshViewBindGroup,
+    environment_map: bool,
+    shade_view: &'a TextureView,
+    buffers: ShadeBuffers<'a>,
+}
+
+fn draw_shade(ctx: &mut RenderContext, cache: &PipelineCache, draw: ShadeDraw<'_>) {
+    let ShadeDraw {
+        pipeline,
+        layout,
+        mesh_view,
+        environment_map,
+        shade_view,
+        buffers: ShadeBuffers { params, targets },
+    } = draw;
+    let hair = ctx.render_device().create_bind_group(
+        None,
+        &cache.get_bind_group_layout(layout),
+        &BindGroupEntries::sequential((
+            params.as_entire_binding(),
+            targets.center.as_entire_binding(),
+            targets.beta.as_entire_binding(),
+            targets.shaded.as_entire_binding(),
+            targets.shaded_depth.as_entire_binding(),
+            targets.dom.as_entire_binding(),
+        )),
+    );
+    let color_attachment = [Some(RenderPassColorAttachment {
+        view: shade_view,
+        depth_slice: None,
+        resolve_target: None,
+        ops: Operations {
+            load: LoadOp::Clear(Default::default()),
+            store: StoreOp::Discard,
+        },
+    })];
+    let mut pass = ctx
+        .command_encoder()
+        .begin_render_pass(&RenderPassDescriptor {
+            label: Some("hair_shade"),
+            color_attachments: &color_attachment,
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &mesh_view.main, &mesh_view.main_offsets);
+    if environment_map {
+        pass.set_bind_group(1, &mesh_view.binding_array, &[]);
+    } else {
+        pass.set_bind_group(1, &mesh_view.empty, &[]);
+    }
+    pass.set_bind_group(2, &hair, &[]);
+    pass.draw(0..3, 0..1);
 }
 
 fn dispatch_raster(

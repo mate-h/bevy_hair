@@ -1,11 +1,15 @@
 use bevy::prelude::*;
 use std::num::NonZeroU64;
 
+use bevy::pbr::{MeshPipeline, MeshPipelineViewLayoutKey, MeshPipelineViewLayouts};
 use bevy::render::render_resource::binding_types::{
     storage_buffer_read_only_sized, storage_buffer_sized, texture_depth_2d, uniform_buffer_sized,
 };
 use bevy::render::render_resource::*;
 const COMMON: &str = include_str!("shaders/common.wgsl");
+
+/// `HairParams` uniform size. Keep in sync with `shaders/common.wgsl`.
+pub const HAIR_PARAMS_SIZE: u64 = 432;
 
 #[derive(Resource, Clone)]
 pub struct HairShaderHandles {
@@ -51,12 +55,7 @@ pub fn load_shaders(shaders: &mut Assets<Shader>) -> HairShaderHandles {
             include_str!("shaders/raster.wgsl"),
             true,
         ),
-        shade: shader(
-            shaders,
-            "hair_shade.wgsl",
-            include_str!("shaders/shade.wgsl"),
-            true,
-        ),
+        shade: shaders.add(Shader::from_wgsl(shade_source(), "hair_shade.wgsl")),
         filter: shader(
             shaders,
             "hair_filter.wgsl",
@@ -84,8 +83,6 @@ pub struct HairPipelines {
     pub scan_layout: BindGroupLayoutDescriptor,
     pub raster: CachedComputePipelineId,
     pub raster_layout: BindGroupLayoutDescriptor,
-    pub shade: CachedComputePipelineId,
-    pub shade_layout: BindGroupLayoutDescriptor,
     pub filter: CachedComputePipelineId,
     pub filter_layout: BindGroupLayoutDescriptor,
     pub composite_layout: BindGroupLayoutDescriptor,
@@ -96,6 +93,8 @@ pub fn init_pipelines(
     mut commands: Commands,
     shader_handles: Res<HairShaderHandles>,
     pipeline_cache: Res<PipelineCache>,
+    mesh_view_layouts: Res<MeshPipelineViewLayouts>,
+    mesh_pipeline: Res<MeshPipeline>,
 ) {
     let HairShaderHandles {
         clear,
@@ -151,8 +150,8 @@ pub fn init_pipelines(
     let shade_layout = BindGroupLayoutDescriptor::new(
         "hair_shade",
         &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (params_uniform(), ro(8), ro(4), rw(16), rw(4), ro(4), ro(16)),
+            ShaderStages::FRAGMENT,
+            (params_uniform(), ro(8), ro(4), rw(16), rw(4), ro(4)),
         ),
     );
     let filter_layout = BindGroupLayoutDescriptor::new(
@@ -191,14 +190,78 @@ pub fn init_pipelines(
         scan_layout,
         raster: queue("hair_raster", &raster_layout, &raster),
         raster_layout,
-        shade: queue("hair_shade", &shade_layout, &shade),
-        shade_layout,
         filter: queue("hair_filter", &filter_layout, &filter),
         filter_layout,
         composite_layout,
         composite_shader: composite,
     };
     commands.insert_resource(pipelines);
+    commands.insert_resource(HairShadePipeline {
+        mesh_view_layouts: mesh_view_layouts.clone(),
+        binding_arrays_are_usable: mesh_pipeline.binding_arrays_are_usable,
+        shader: shade,
+        layout: shade_layout,
+    });
+    commands.init_resource::<SpecializedRenderPipelines<HairShadePipeline>>();
+}
+
+/// Fullscreen shade pass. Group 0 and 1 are the mesh view layouts so the
+/// fragment shader can bind [`bevy::pbr::MeshViewBindGroup`].
+#[derive(Resource)]
+pub struct HairShadePipeline {
+    mesh_view_layouts: MeshPipelineViewLayouts,
+    binding_arrays_are_usable: bool,
+    shader: Handle<Shader>,
+    pub(crate) layout: BindGroupLayoutDescriptor,
+}
+
+impl SpecializedRenderPipeline for HairShadePipeline {
+    type Key = MeshPipelineViewLayoutKey;
+
+    fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
+        let mut shader_defs = vec!["SHADOW_FILTER_METHOD_HARDWARE_2X2".into()];
+        if key.contains(MeshPipelineViewLayoutKey::ENVIRONMENT_MAP) {
+            shader_defs.push("ENVIRONMENT_MAP".into());
+        }
+        if key.contains(MeshPipelineViewLayoutKey::AREA_LIGHT_LUTS) {
+            shader_defs.push("AREA_LIGHT_LUTS".into());
+        }
+        if self.binding_arrays_are_usable {
+            shader_defs.push("MULTIPLE_LIGHT_PROBES_IN_ARRAY".into());
+        }
+
+        let view_layout = self.mesh_view_layouts.get_view_layout(key);
+        let probe_layout = if key.contains(MeshPipelineViewLayoutKey::ENVIRONMENT_MAP) {
+            view_layout.binding_array_layout
+        } else {
+            view_layout.empty_layout
+        };
+
+        RenderPipelineDescriptor {
+            label: Some("hair_shade".into()),
+            layout: vec![view_layout.main_layout, probe_layout, self.layout.clone()],
+            vertex: VertexState {
+                shader: self.shader.clone(),
+                shader_defs: shader_defs.clone(),
+                entry_point: Some("vs".into()),
+                buffers: Vec::new(),
+            },
+            fragment: Some(FragmentState {
+                shader: self.shader.clone(),
+                shader_defs,
+                entry_point: Some("fs".into()),
+                targets: vec![Some(ColorTargetState {
+                    format: TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            ..default()
+        }
+    }
 }
 
 fn shader(shaders: &mut Assets<Shader>, name: &str, body: &str, common: bool) -> Handle<Shader> {
@@ -211,7 +274,16 @@ fn shader(shaders: &mut Assets<Shader>, name: &str, body: &str, common: bool) ->
 }
 
 fn params_uniform() -> bevy::render::render_resource::BindGroupLayoutEntryBuilder {
-    uniform_buffer_sized(false, NonZeroU64::new(720))
+    uniform_buffer_sized(false, NonZeroU64::new(HAIR_PARAMS_SIZE))
+}
+
+fn shade_source() -> String {
+    let body = include_str!("shaders/shade.wgsl");
+    let (imports, rest) = body
+        .split_once("@group")
+        .expect("shade.wgsl bindings follow the imports");
+    // `HairParams` has to exist before the bindings, and the `#import` block has to stay first.
+    format!("{imports}\n{COMMON}\n@group{rest}")
 }
 
 fn ro(size: u64) -> bevy::render::render_resource::BindGroupLayoutEntryBuilder {
@@ -281,7 +353,6 @@ mod shader_parse {
         parse("lod", &with_common(include_str!("shaders/lod.wgsl")));
         parse("scan", &with_common(include_str!("shaders/scan.wgsl")));
         parse("raster", &with_common(include_str!("shaders/raster.wgsl")));
-        parse("shade", &with_common(include_str!("shaders/shade.wgsl")));
         parse("filter", &with_common(include_str!("shaders/filter.wgsl")));
         parse(
             "composite",

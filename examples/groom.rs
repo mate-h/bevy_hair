@@ -17,15 +17,16 @@ use std::f32::consts::FRAC_PI_2;
 use std::fmt;
 
 use bevy::app::{PluginGroup, RunFixedMainLoop, RunFixedMainLoopSystems};
-use bevy::log::LogPlugin;
 use bevy::camera::Hdr;
+use bevy::light::Skybox;
+use bevy::log::LogPlugin;
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
 use bevy::render::RenderPlugin;
 use bevy::render::render_resource::{TextureUsages, WgpuFeatures};
 use bevy::render::settings::WgpuSettings;
 use bevy_camera_controller::free_camera::{
-    run_freecamera_controller, FreeCamera, FreeCameraPlugin,
+    FreeCamera, FreeCameraPlugin, run_freecamera_controller,
 };
 use bevy_hair::{HairGroom, HairMesh, HairPlugin, LAYER_COUNT, Scalp};
 
@@ -137,6 +138,7 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut hair: ResMut<Assets<HairMesh>>,
+    asset_server: Res<AssetServer>,
 ) {
     let handles = [
         hair.add(std::mem::replace(&mut prepared.grooms[0], empty_groom())),
@@ -157,8 +159,13 @@ fn setup(
     commands.spawn((
         Mesh3d(meshes.add(head)),
         MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.72, 0.55, 0.46),
-            perceptual_roughness: 0.65,
+            base_color: Color::srgb(0.73, 0.52, 0.44),
+            perceptual_roughness: 0.45,
+            metallic: 0.0,
+            specular_tint: Color::srgb(1.0, 0.74, 0.62),
+            diffuse_transmission: 0.18,
+            attenuation_color: Color::srgb(0.9, 0.22, 0.12),
+            attenuation_distance: 6.0,
             ..default()
         })),
         model,
@@ -166,12 +173,21 @@ fn setup(
     commands.spawn((
         HairGroom {
             mesh: handles[0].clone(),
+            // Roughness picks a prefiltered specular mip. Tilt shifts the primary R highlight.
+            albedo: Color::srgb(0.26, 0.11, 0.05),
+            roughness: 0.45,
+            tilt: 0.05,
             ..default()
         },
         model,
     ));
     commands.insert_resource(GroomLibrary { handles, active: 0 });
 
+    // One value for the face IBL, the skybox, and the hair probe lookup.
+    const ENV_INTENSITY: f32 = 200.0;
+    let diffuse = asset_server.load("env/little_paris_eiffel_tower_2k_diffuse.ktx2");
+    let specular = asset_server.load("env/little_paris_eiffel_tower_2k_specular.ktx2");
+    let skybox = asset_server.load("env/little_paris_eiffel_tower_2k_skybox.ktx2");
     commands.spawn((
         Camera3d {
             depth_texture_usages: (TextureUsages::RENDER_ATTACHMENT
@@ -181,6 +197,17 @@ fn setup(
         },
         Hdr,
         Msaa::Off,
+        EnvironmentMapLight {
+            diffuse_map: diffuse,
+            specular_map: specular,
+            intensity: ENV_INTENSITY,
+            ..default()
+        },
+        Skybox {
+            image: Some(skybox),
+            brightness: ENV_INTENSITY,
+            ..default()
+        },
         Transform::from_xyz(focus.x + 150.0, focus.y + 18.0, focus.z + 40.0)
             .looking_at(focus, Vec3::Y),
         FreeCamera {
@@ -193,38 +220,17 @@ fn setup(
         },
     ));
 
+    // The bake's white point removes the sun. This key replaces it.
+    // Exposure stays at Bevy's default, EV 9.7.
     let key = focus + Vec3::new(70.0, 90.0, 50.0);
-    let fill = focus + Vec3::new(20.0, 40.0, -80.0);
-    let rim = focus + Vec3::new(-100.0, 30.0, -20.0);
     commands.spawn((
-        PointLight {
-            color: Color::srgb(1.0, 0.93, 0.82),
-            intensity: 12_000_000.0,
-            range: 500.0,
-            shadow_maps_enabled: false,
+        DirectionalLight {
+            color: Color::srgb(1.0, 0.95, 0.86),
+            illuminance: 60_000.0,
+            shadow_maps_enabled: true,
             ..default()
         },
-        Transform::from_translation(key),
-    ));
-    commands.spawn((
-        PointLight {
-            color: Color::srgb(0.65, 0.75, 1.0),
-            intensity: 4_000_000.0,
-            range: 500.0,
-            shadow_maps_enabled: false,
-            ..default()
-        },
-        Transform::from_translation(fill),
-    ));
-    commands.spawn((
-        PointLight {
-            color: Color::srgb(1.0, 0.85, 0.7),
-            intensity: 3_000_000.0,
-            range: 500.0,
-            shadow_maps_enabled: false,
-            ..default()
-        },
-        Transform::from_translation(rim),
+        Transform::from_translation(key).looking_at(focus, Vec3::Y),
     ));
 }
 
@@ -288,11 +294,7 @@ fn controls(
 }
 
 fn on_off(enabled: bool) -> &'static str {
-    if enabled {
-        "on"
-    } else {
-        "off"
-    }
+    if enabled { "on" } else { "off" }
 }
 
 fn draw_cages(

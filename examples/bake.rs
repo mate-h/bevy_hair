@@ -13,7 +13,7 @@ use std::sync::Once;
 use std::time::Instant;
 
 use bevy::app::App;
-use bevy::log::{info, warn, LogPlugin};
+use bevy::log::{LogPlugin, info, warn};
 use bevy::math::Vec3;
 use bevy_hair::{
     BAKE_FINGERPRINT, BundleDesc, CageCorner, HairMesh, Scalp, bake_hair_mesh_with_scalp,

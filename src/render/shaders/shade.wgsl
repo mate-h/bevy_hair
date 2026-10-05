@@ -1,12 +1,28 @@
-@group(0) @binding(0) var<uniform> params: HairParams;
-@group(0) @binding(1) var<storage, read> center: array<u64>;
-@group(0) @binding(2) var<storage, read> beta_buf: array<u32>;
-@group(0) @binding(3) var<storage, read_write> shaded: array<vec4<f32>>;
-@group(0) @binding(4) var<storage, read_write> shaded_depth: array<f32>;
-@group(0) @binding(5) var<storage, read> dom: array<u32>;
-@group(0) @binding(6) var<storage, read> env_tex: array<vec4<f32>>;
+#import bevy_core_pipeline::fullscreen_vertex_shader::{
+    FullscreenVertexOutput, fullscreen_vertex_shader,
+}
+#import bevy_pbr::clustered_forward as clustering
+#import bevy_pbr::lighting::{getDistanceAttenuation, getRangeFalloff}
+#import bevy_pbr::mesh_view_bindings as view_bindings
+#import bevy_pbr::mesh_view_types::{
+    DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT, POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT,
+    POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE,
+}
+#import bevy_pbr::shadows::{fetch_directional_shadow, fetch_point_shadow, fetch_spot_shadow}
+
+@group(2) @binding(0) var<uniform> params: HairParams;
+@group(2) @binding(1) var<storage, read> center: array<u64>;
+@group(2) @binding(2) var<storage, read> beta_buf: array<u32>;
+@group(2) @binding(3) var<storage, read_write> shaded: array<vec4<f32>>;
+@group(2) @binding(4) var<storage, read_write> shaded_depth: array<f32>;
+@group(2) @binding(5) var<storage, read> dom: array<u32>;
 
 const IOR: f32 = 1.55;
+
+@vertex
+fn vs(@builtin(vertex_index) vertex_index: u32) -> FullscreenVertexOutput {
+    return fullscreen_vertex_shader(vertex_index);
+}
 
 fn logistic(x: f32, s: f32) -> f32 {
     let ss = max(s, 1e-3);
@@ -55,50 +71,6 @@ fn hair_bsdf(tangent: vec3<f32>, view: vec3<f32>, light: vec3<f32>, albedo: vec3
     return spec * cos_i + diffuse * 0.35;
 }
 
-fn sh_eval(n_in: vec3<f32>) -> vec3<f32> {
-    let n = safe_normalize(n_in);
-    let x = n.x;
-    let y = n.y;
-    let z = n.z;
-    var e = params.sh[0].xyz * 0.282095;
-    e += params.sh[1].xyz * (0.488603 * y);
-    e += params.sh[2].xyz * (0.488603 * z);
-    e += params.sh[3].xyz * (0.488603 * x);
-    e += params.sh[4].xyz * (1.092548 * x * y);
-    e += params.sh[5].xyz * (1.092548 * y * z);
-    e += params.sh[6].xyz * (0.315392 * (3.0 * z * z - 1.0));
-    e += params.sh[7].xyz * (1.092548 * x * z);
-    e += params.sh[8].xyz * (0.546274 * (x * x - y * y));
-    return max(e, vec3<f32>(0.0));
-}
-
-fn mip_info(mip: u32) -> vec4<u32> {
-    if mip == 0u { return params.env_mip0; }
-    if mip == 1u { return params.env_mip1; }
-    if mip == 2u { return params.env_mip2; }
-    return params.env_mip3;
-}
-
-fn sample_mip(mip: u32, u: f32, v: f32) -> vec4<f32> {
-    let info = mip_info(mip);
-    let width = max(info.y, 1u);
-    let height = max(info.z, 1u);
-    let x = min(u32(clamp(u, 0.0, 0.999) * f32(width)), width - 1u);
-    let y = min(u32(clamp(v, 0.0, 0.999) * f32(height)), height - 1u);
-    return env_tex[info.x + y * width + x];
-}
-
-fn sample_env(dir_in: vec3<f32>, roughness: f32) -> vec3<f32> {
-    let dir = safe_normalize(dir_in);
-    let u = atan2(dir.z, dir.x) / (2.0 * PI) + 0.5;
-    let v = acos(clamp(dir.y, -1.0, 1.0)) / PI;
-    let mip = clamp(roughness, 0.0, 1.0) * 3.0;
-    let mip0 = u32(floor(mip));
-    let mip1 = min(mip0 + 1u, 3u);
-    let tm = mip - f32(mip0);
-    return mix(sample_mip(mip0, u, v), sample_mip(mip1, u, v), tm).xyz;
-}
-
 fn dom_visibility(world: vec3<f32>, beta: f32) -> f32 {
     if params.flags.w == 0u {
         return 1.0;
@@ -120,7 +92,7 @@ fn dom_visibility(world: vec3<f32>, beta: f32) -> f32 {
     );
     let near = params.dom_info.z;
     let far = params.dom_info.w;
-    let dist = dot(world - params.lights[0].xyz, params.light_forward.xyz);
+    let dist = dot(world - params.light_eye.xyz, params.light_forward.xyz);
     let z = clamp((dist - near) / max(far - near, 1e-3), 0.0, 1.0);
     // Eq. 8, scaled into the light-view depth range.
     let delta = -log(max(beta, 1e-4)) * params.filter_params.z;
@@ -136,56 +108,234 @@ fn dom_visibility(world: vec3<f32>, beta: f32) -> f32 {
     return exp(-occ * params.filter_params.w);
 }
 
-@compute @workgroup_size(8, 8, 1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+fn spot_mask(light_id: u32, world: vec3<f32>) -> f32 {
+    let light = &view_bindings::clustered_lights.data[light_id];
+    var spot_dir = vec3<f32>((*light).light_custom_data.x, 0.0, (*light).light_custom_data.y);
+    spot_dir.y = sqrt(max(0.0, 1.0 - spot_dir.x * spot_dir.x - spot_dir.z * spot_dir.z));
+    if ((*light).flags & POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE) != 0u {
+        spot_dir.y = -spot_dir.y;
+    }
+    let light_to_frag = (*light).position_radius.xyz - world;
+    let cd = dot(-spot_dir, safe_normalize(light_to_frag));
+    let attenuation = clamp(
+        cd * (*light).light_custom_data.z + (*light).light_custom_data.w,
+        0.0,
+        1.0,
+    );
+    return attenuation * attenuation;
+}
+
+fn quat_rotate(q: vec4<f32>, dir: vec3<f32>) -> vec3<f32> {
+    let t = 2.0 * cross(q.xyz, dir);
+    return dir + q.w * t + cross(q.xyz, t);
+}
+
+fn cubemap_dir(dir: vec3<f32>) -> vec3<f32> {
+    var sample_dir = quat_rotate(view_bindings::light_probes.view_rotation, dir);
+    // Cubemaps are left-handed.
+    sample_dir.z = -sample_dir.z;
+    return sample_dir;
+}
+
+fn probe_radiance(fiber_n: vec3<f32>, view: vec3<f32>, roughness: f32) -> vec3<f32> {
+#ifdef ENVIRONMENT_MAP
+    if view_bindings::light_probes.view_cubemap_index < 0 {
+        return vec3<f32>(0.0);
+    }
+    let spec_dir = cubemap_dir(reflect(-view, fiber_n));
+    let diff_dir = cubemap_dir(fiber_n);
+#ifdef MULTIPLE_LIGHT_PROBES_IN_ARRAY
+    let index = u32(view_bindings::light_probes.view_cubemap_index);
+    let last_mip = f32(textureNumLevels(view_bindings::specular_environment_maps[index]) - 1u);
+    let spec = textureSampleLevel(
+        view_bindings::specular_environment_maps[index],
+        view_bindings::environment_map_sampler,
+        spec_dir,
+        roughness * last_mip,
+    ).rgb;
+    let diff = textureSampleLevel(
+        view_bindings::diffuse_environment_maps[index],
+        view_bindings::environment_map_sampler,
+        diff_dir,
+        0.0,
+    ).rgb;
+#else
+    let last_mip = f32(view_bindings::light_probes.smallest_specular_mip_level_for_view);
+    let spec = textureSampleLevel(
+        view_bindings::specular_environment_map,
+        view_bindings::environment_map_sampler,
+        spec_dir,
+        roughness * last_mip,
+    ).rgb;
+    let diff = textureSampleLevel(
+        view_bindings::diffuse_environment_map,
+        view_bindings::environment_map_sampler,
+        diff_dir,
+        0.0,
+    ).rgb;
+#endif
+    // One specular lobe stands in for R and TRT. The diffuse cubemap is already irradiance.
+    return (spec + diff) * view_bindings::light_probes.intensity_for_view;
+#else
+    // This specialization has no cubemap bindings. Keep the arguments referenced.
+    return vec3<f32>(dot(fiber_n, view) * roughness * 0.0);
+#endif
+}
+
+fn direct_light(
+    world: vec3<f32>,
+    tangent: vec3<f32>,
+    view: vec3<f32>,
+    fiber_n: vec3<f32>,
+    albedo: vec3<f32>,
+    roughness: f32,
+    tilt: f32,
+    beta: f32,
+    frag_xy: vec2<f32>,
+    view_z: f32,
+    ortho: bool,
+) -> vec3<f32> {
+    let world_h = vec4<f32>(world, 1.0);
+    let cluster_index = clustering::view_fragment_cluster_index(frag_xy, view_z, ortho);
+    let ranges = clustering::unpack_clusterable_object_index_ranges(cluster_index);
+    var color = vec3<f32>(0.0);
+
+    for (var i = ranges.first_point_light_index_offset; i < ranges.first_spot_light_index_offset; i++) {
+        let light_id = clustering::get_clusterable_object_id(i);
+        let light = &view_bindings::clustered_lights.data[light_id];
+        let light_to_frag = (*light).position_radius.xyz - world;
+        let dist2 = dot(light_to_frag, light_to_frag);
+        let incident = safe_normalize(light_to_frag);
+        let attenuation = getDistanceAttenuation(dist2, (*light).color_inverse_square_range.w);
+        var shadow = 1.0;
+        if ((*light).flags & POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u {
+            shadow = fetch_point_shadow(light_id, world_h, fiber_n, frag_xy);
+        }
+        let lobe = hair_bsdf(tangent, view, incident, albedo, roughness, tilt);
+        color += lobe * (*light).color_inverse_square_range.rgb * attenuation * shadow;
+    }
+
+    for (var i = ranges.first_spot_light_index_offset; i < ranges.first_reflection_probe_index_offset; i++) {
+        let light_id = clustering::get_clusterable_object_id(i);
+        let light = &view_bindings::clustered_lights.data[light_id];
+        let light_to_frag = (*light).position_radius.xyz - world;
+        let dist2 = dot(light_to_frag, light_to_frag);
+        let incident = safe_normalize(light_to_frag);
+        let attenuation = getDistanceAttenuation(dist2, (*light).color_inverse_square_range.w);
+        var shadow = 1.0;
+        if ((*light).flags & POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u {
+            shadow = fetch_spot_shadow(light_id, world_h, fiber_n, (*light).shadow_map_near_z, frag_xy);
+        }
+        let lobe = hair_bsdf(tangent, view, incident, albedo, roughness, tilt);
+        color += lobe * (*light).color_inverse_square_range.rgb * attenuation * spot_mask(light_id, world) * shadow;
+    }
+
+    var dom_left = true;
+    let n_directional = view_bindings::lights.n_directional_lights;
+    for (var i = 0u; i < n_directional; i++) {
+        let light = &view_bindings::lights.directional_lights[i];
+        let incident = (*light).direction_to_light;
+        var shadow = 1.0;
+        let casts = ((*light).flags & DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u;
+        if casts {
+            shadow = fetch_directional_shadow(i, world_h, fiber_n, view_z, frag_xy);
+        }
+        if dom_left && casts {
+            shadow *= dom_visibility(world, beta);
+            dom_left = false;
+        }
+        let lobe = hair_bsdf(tangent, view, incident, albedo, roughness, tilt);
+        color += lobe * (*light).color.rgb * shadow;
+    }
+
+#ifdef AREA_LIGHT_LUTS
+    let n_rect = view_bindings::lights.n_rect_lights;
+    for (var i = 0u; i < n_rect; i++) {
+        let light = &view_bindings::lights.rect_lights[i];
+        let to_center = (*light).position - world;
+        let dist2 = max(dot(to_center, to_center), 1e-4);
+        let incident = to_center * inverseSqrt(dist2);
+        let normal = safe_normalize(cross((*light).up, (*light).right));
+        let facing = max(dot(normal, incident), 0.0);
+        let solid = (*light).width * (*light).height * facing / dist2;
+        let range2 = max((*light).range * (*light).range, 1e-4);
+        let falloff = getRangeFalloff(dist2, 1.0 / range2);
+        let lobe = hair_bsdf(tangent, view, incident, albedo, roughness, tilt);
+        color += lobe * (*light).color.rgb * solid * falloff;
+    }
+#endif
+
+    return color;
+}
+
+@fragment
+fn fs(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let width = u32(params.screen.x);
     let height = u32(params.screen.y);
-    if id.x >= width || id.y >= height {
-        return;
+    let x = u32(in.position.x);
+    let y = u32(in.position.y);
+    if x >= width || y >= height {
+        return vec4<f32>(0.0);
     }
-    let pix = id.y * width + id.x;
+    let pix = y * width + x;
     let word = center[pix];
     if is_empty(word) {
         shaded[pix] = vec4<f32>(0.0);
         shaded_depth[pix] = 0.0;
-        return;
+        return vec4<f32>(0.0);
     }
     let unpacked = unpack_gb(word);
     let view_dist = dequantize_depth(unpacked.depth, params.screen.z, params.screen.w);
-    let world = reconstruct_world(params, vec2<i32>(i32(id.x), i32(id.y)), view_dist);
+    let world = reconstruct_world(params, vec2<i32>(i32(x), i32(y)), view_dist);
     let tangent = oct_decode(unpacked.tx, unpacked.ty);
     let uvw = dequant_uvw(unpacked.uvw);
     var ao = f32(unpacked.ao) / 63.0;
     if params.flags.z == 0u {
         ao = 1.0;
     }
-    let beta_word = beta_buf[pix];
-    let beta = f32(beta_word & 0xffu) / 255.0;
+    let beta = f32(beta_buf[pix] & 0xffu) / 255.0;
     let roughness = max(params.appearance.x * (0.65 + 0.7 * uvw.z), 0.04);
     let tilt = params.appearance.y;
     let albedo = params.albedo.xyz * (0.65 + 0.35 * uvw.z);
 
-    let view = safe_normalize(params.camera_pos.xyz - world);
-    let fiber_n = safe_normalize(view - tangent * dot(view, tangent));
-    var color = vec3<f32>(0.0);
-    let vis = dom_visibility(world, beta);
-    for (var i = 0u; i < 3u; i++) {
-        let to_l = params.lights[i].xyz - world;
-        let dist2 = max(dot(to_l, to_l), 1e-3);
-        let light = to_l * inverseSqrt(dist2);
-        var lobe = hair_bsdf(tangent, view, light, albedo, roughness, tilt);
-        if i == 0u {
-            lobe *= vis;
-        }
-        color += lobe * params.light_colors[i].xyz / (dist2 * 0.002 + 1.0);
+    let world_h = vec4<f32>(world, 1.0);
+    let view_z = dot(vec4<f32>(
+        view_bindings::view.view_from_world[0].z,
+        view_bindings::view.view_from_world[1].z,
+        view_bindings::view.view_from_world[2].z,
+        view_bindings::view.view_from_world[3].z,
+    ), world_h);
+    let ortho = view_bindings::view.clip_from_view[3].w == 1.0;
+    var view: vec3<f32>;
+    if ortho {
+        view = safe_normalize(vec3<f32>(
+            view_bindings::view.clip_from_world[0].z,
+            view_bindings::view.clip_from_world[1].z,
+            view_bindings::view.clip_from_world[2].z,
+        ));
+    } else {
+        view = safe_normalize(view_bindings::view.world_position.xyz - world);
     }
+    let fiber_n = safe_normalize(view - tangent * dot(view, tangent));
 
-    let reflected = reflect(-view, fiber_n);
-    let spec_env = sample_env(reflected, roughness);
-    let diff_env = sh_eval(fiber_n) / PI;
-    color += spec_env * mix(vec3<f32>(1.0), albedo, 0.35) * ao * 0.35;
-    color += diff_env * albedo * ao;
+    var color = direct_light(
+        world,
+        tangent,
+        view,
+        fiber_n,
+        albedo,
+        roughness,
+        tilt,
+        beta,
+        in.position.xy,
+        view_z,
+        ortho,
+    );
+    color += probe_radiance(fiber_n, view, roughness) * albedo * ao;
+    // The mesh pipeline scales physical radiance by exposure before the HDR target.
+    color *= view_bindings::view.exposure;
 
     shaded[pix] = vec4<f32>(color, 1.0);
     shaded_depth[pix] = view_dist;
+    return vec4<f32>(0.0);
 }

@@ -6,6 +6,7 @@
 //! Chiang shading with a deep opacity map, and the reconnection filter.
 
 mod bake;
+#[cfg(test)]
 mod env;
 #[cfg(test)]
 mod gbuffer;

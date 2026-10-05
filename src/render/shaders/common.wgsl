@@ -17,15 +17,10 @@ struct HairParams {
     albedo: vec4<f32>,
     flags: vec4<u32>,
     pass_mode: vec4<u32>,
-    lights: array<vec4<f32>, 3>,
-    light_colors: array<vec4<f32>, 3>,
-    sh: array<vec4<f32>, 9>,
+    // Deep opacity map light view. Not a copy of the clustered light list.
+    light_eye: vec4<f32>,
     light_forward: vec4<f32>,
     dom_info: vec4<f32>,
-    env_mip0: vec4<u32>,
-    env_mip1: vec4<u32>,
-    env_mip2: vec4<u32>,
-    env_mip3: vec4<u32>,
 }
 
 struct BundleInfo {
