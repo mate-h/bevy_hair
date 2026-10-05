@@ -1,8 +1,8 @@
 # bevy_hair
 
-Deferred software rasterization for strand hair, following Lipp, Jarabo, Wimmer, and Bode, *Deferred Software Rasterization for Efficient Real-time Hair Rendering* (2026).
+Real-time strand hair with deferred software rasterization on hair meshes.
 
-The renderer is a Bevy 0.19 plugin. It bakes explicit strands into layered hair-mesh bundles, generates strands in a subgroup compute shader, and rasterizes them into a 64-bit atomic G-buffer. Shading is Chiang et al. 2016 (R, TT, TRT) plus a Kajiya–Kay diffuse lobe, a 4-layer deep opacity map, a GGX prefiltered probe, irradiance spherical harmonics, baked ambient occlusion, and the paper’s reconnection filter.
+The renderer is a Bevy 0.19 plugin. It bakes explicit strands into layered hair-mesh bundles, generates strands in a subgroup compute shader, and rasterizes them into a 64-bit atomic G-buffer. Shading covers reflection, transmission, and internal scatter paths, plus a Kajiya–Kay diffuse lobe, a 4-layer deep opacity map, a GGX prefiltered probe, irradiance spherical harmonics, baked ambient occlusion, and a reconnection filter for coverage reconstruction.
 
 Native wgpu is required. The example requests subgroup operations and 64-bit atomic min/max (`SHADER_INT64`, `SHADER_INT64_ATOMIC_MIN_MAX`). That combination is available on Metal (Apple9, or Apple8 with Mac2), Vulkan, and DX12. Browser WebGPU is out of scope.
 
@@ -34,3 +34,11 @@ The example uses Cem Yuksel’s woman grooms and the matching head mesh by Murat
 <https://www.cemyuksel.com/research/hairmodels>
 
 Those files live in `assets/hair/`. Public material that shows them should link that page.
+
+## Reference
+
+Lipp, Jarabo, Wimmer, and Bode (2026). *Deferred Software Rasterization for Efficient Real-time Hair Rendering.* Proceedings of the ACM on Computer Graphics and Interactive Techniques, 9(4).
+
+<https://arxiv.org/abs/2607.04230>
+
+<https://doi.org/10.1145/3820015>
