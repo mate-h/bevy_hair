@@ -1,16 +1,23 @@
 //! Convert explicit strands into the hair-mesh cages the rasterizer generates from.
 //!
-//! Roots are clustered in the scalp PCA plane. Each occupied cell becomes a quad bundle
-//! whose layers are oriented cross-sections. The styling function `S(uvw)` is the mean
-//! residual of those strands from the cage, stored as a trilinear volume.
+//! Roots are clustered in the scalp PCA plane, then a cluster is split until its quad
+//! stays on those strands. The rasterizer draws `uv = rand.next2()` uniformly inside
+//! each quad (Lipp et al. 2026, Appendix B), so a quad that spans empty space grows
+//! hair there. The styling function `S(uvw)` is the mean residual from the cage,
+//! stored as a trilinear volume.
 
 use bevy::math::{Mat3, Vec2, Vec3};
 
 use crate::hair_file::HairStrands;
-use crate::mesh::{BundleDesc, CageCorner, HairMesh, LAYER_COUNT, STYLE_TEXELS, STYLE_U, STYLE_V};
+use crate::mesh::{
+    BundleDesc, CageCorner, HairMesh, LAYER_COUNT, STYLE_TEXELS, STYLE_U, STYLE_V, STYLE_W,
+};
 
 const MIN_STRANDS_PER_BUNDLE: usize = 8;
 const TARGET_STRANDS_PER_CELL: f32 = 180.0;
+/// Split a bundle when a sample of its quad is farther than this from every strand.
+/// The uniform uv draw in Appendix B fills the whole quad, not just the strands.
+const MAX_QUAD_GAP: f32 = 5.0;
 
 pub fn bake_hair_mesh(strands: &HairStrands) -> HairMesh {
     let strand_count = strands.strands.len();
@@ -101,31 +108,32 @@ pub fn bake_hair_mesh(strands: &HairStrands) -> HairMesh {
         members
     };
 
+    let mut coherent = Vec::new();
+    for group in members.iter().filter(|g| g.len() >= MIN_STRANDS_PER_BUNDLE) {
+        coherent.extend(split_until_coherent(strands, group));
+    }
+
     let mut bundles = Vec::new();
     let mut corners = Vec::new();
     let mut style = Vec::new();
     let mut bounds_min = Vec3::splat(f32::MAX);
     let mut bounds_max = Vec3::splat(f32::MIN);
 
-    for group in members.iter().filter(|g| g.len() >= MIN_STRANDS_PER_BUNDLE) {
+    for group in &coherent {
         let resampled = resample_group(strands, group);
         if resampled.is_empty() {
             continue;
         }
-        let root_frame = cross_section_frame(&resampled, 0);
+        let frames = frames_for(&resampled);
+        let root_frame = frames[0];
         let mut layer_corners = Vec::with_capacity(LAYER_COUNT as usize);
-        for layer in 0..LAYER_COUNT as usize {
-            let frame = if layer == 0 {
-                root_frame
-            } else {
-                oriented_frame(&resampled, layer, root_frame.axis_u, root_frame.axis_v)
-            };
+        for frame in &frames {
             let quad = frame.quad();
             for corner in quad {
                 bounds_min = bounds_min.min(corner);
                 bounds_max = bounds_max.max(corner);
             }
-            layer_corners.push((frame, quad));
+            layer_corners.push((*frame, quad));
         }
 
         let layer_offset = corners.len() as u32;
@@ -234,14 +242,18 @@ impl Frame {
         let d = point - self.mean;
         let lu = d.dot(self.axis_u);
         let lv = d.dot(self.axis_v);
-        Vec2::new(
-            lu / (2.0 * self.ext_u) + 0.5,
-            lv / (2.0 * self.ext_v) + 0.5,
-        )
+        Vec2::new(lu / (2.0 * self.ext_u) + 0.5, lv / (2.0 * self.ext_v) + 0.5)
     }
 }
 
 fn resample_group(strands: &HairStrands, group: &[usize]) -> Vec<Vec<Vec3>> {
+    resample_indexed(strands, group)
+        .into_iter()
+        .map(|(_, samples)| samples)
+        .collect()
+}
+
+fn resample_indexed(strands: &HairStrands, group: &[usize]) -> Vec<(usize, Vec<Vec3>)> {
     let layers = LAYER_COUNT as usize;
     let mut out = Vec::with_capacity(group.len());
     for &strand in group {
@@ -269,7 +281,7 @@ fn resample_group(strands: &HairStrands, group: &[usize]) -> Vec<Vec<Vec3>> {
             let t = ((target - cumulative[index - 1]) / span).clamp(0.0, 1.0);
             samples.push(pts[index - 1].lerp(pts[index], t));
         }
-        out.push(samples);
+        out.push((strand, samples));
     }
     out
 }
@@ -304,21 +316,11 @@ fn oriented_frame(strands: &[Vec<Vec3>], layer: usize, ref_u: Vec3, ref_v: Vec3)
         tangent += next - prev;
     }
     let normal = tangent.normalize_or(Vec3::Y);
-    // Project the root axes into this layer's plane so uv stays continuous along the strand.
-    let axis_u = (ref_u - normal * ref_u.dot(normal)).normalize_or(ref_u);
-    let mut axis_v = (ref_v - normal * ref_v.dot(normal)).normalize_or(normal.cross(axis_u));
-    if axis_u.dot(axis_v).abs() > 0.9 {
-        axis_v = normal.cross(axis_u).normalize_or(Vec3::X);
-    } else {
-        axis_v = axis_v.normalize_or(normal.cross(axis_u));
-    }
-    let mut ext_u = 1e-3f32;
-    let mut ext_v = 1e-3f32;
-    for point in &points {
-        let d = *point - mean;
-        ext_u = ext_u.max(d.dot(axis_u).abs());
-        ext_v = ext_v.max(d.dot(axis_v).abs());
-    }
+    // Carry the previous layer's axes into this plane. Re-using an axis that has
+    // turned parallel to the strand would tilt the quad out of the cross-section.
+    let (axis_u, axis_v) = transported_axes(ref_u, ref_v, normal);
+    let ext_u = robust_extent(points.iter().map(|point| (*point - mean).dot(axis_u)));
+    let ext_v = robust_extent(points.iter().map(|point| (*point - mean).dot(axis_v)));
     Frame {
         mean,
         axis_u,
@@ -350,20 +352,176 @@ fn planar_extents(points: &[Vec3], mean: Vec3, normal: Vec3) -> (Vec3, Vec3, f32
     let (s, c) = angle.sin_cos();
     let axis_u = (axis_u0 * c + axis_v0 * s).normalize();
     let axis_v = normal.cross(axis_u).normalize();
-    let mut ext_u = 1e-3f32;
-    let mut ext_v = 1e-3f32;
-    for point in points {
-        let d = *point - mean;
-        ext_u = ext_u.max(d.dot(axis_u).abs());
-        ext_v = ext_v.max(d.dot(axis_v).abs());
-    }
+    let ext_u = robust_extent(points.iter().map(|point| (*point - mean).dot(axis_u)));
+    let ext_v = robust_extent(points.iter().map(|point| (*point - mean).dot(axis_v)));
     (axis_u, axis_v, ext_u, ext_v)
+}
+
+fn frames_for(strands: &[Vec<Vec3>]) -> Vec<Frame> {
+    let mut frames = Vec::with_capacity(LAYER_COUNT as usize);
+    let root = cross_section_frame(strands, 0);
+    frames.push(root);
+    for layer in 1..LAYER_COUNT as usize {
+        let prev = frames[layer - 1];
+        frames.push(oriented_frame(strands, layer, prev.axis_u, prev.axis_v));
+    }
+    frames
+}
+
+fn transported_axes(prev_u: Vec3, prev_v: Vec3, normal: Vec3) -> (Vec3, Vec3) {
+    let u_plane = prev_u - normal * prev_u.dot(normal);
+    let v_plane = prev_v - normal * prev_v.dot(normal);
+    let u_len2 = u_plane.length_squared();
+    let v_len2 = v_plane.length_squared();
+    if u_len2 >= v_len2 && u_len2 > 1e-8 {
+        let axis_u = u_plane.normalize();
+        let mut axis_v = normal.cross(axis_u);
+        if axis_v.dot(prev_v) < 0.0 {
+            axis_v = -axis_v;
+        }
+        (axis_u, axis_v.normalize_or(Vec3::X))
+    } else if v_len2 > 1e-8 {
+        let axis_v = v_plane.normalize();
+        let mut axis_u = axis_v.cross(normal);
+        if axis_u.dot(prev_u) < 0.0 {
+            axis_u = -axis_u;
+        }
+        (axis_u.normalize_or(Vec3::X), axis_v)
+    } else {
+        let axis_u = normal.cross(Vec3::Y).normalize_or(Vec3::X);
+        let axis_v = normal.cross(axis_u).normalize_or(Vec3::Z);
+        (axis_u, axis_v)
+    }
+}
+
+/// High percentile of `|projection|`, so one stray strand cannot inflate the quad.
+fn robust_extent(values: impl Iterator<Item = f32>) -> f32 {
+    let mut values: Vec<f32> = values.map(|value| value.abs()).collect();
+    if values.is_empty() {
+        return 1e-3;
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    let rank = ((values.len() - 1) as f32 * 0.9).round() as usize;
+    values[rank].max(1e-3)
+}
+
+fn style_slice(style: &[[f32; 4]], uv: Vec2, layer: usize) -> Vec3 {
+    let u = uv.x.clamp(0.0, 1.0) * (STYLE_U - 1) as f32;
+    let v = uv.y.clamp(0.0, 1.0) * (STYLE_V - 1) as f32;
+    let u0 = u.floor() as usize;
+    let v0 = v.floor() as usize;
+    let u1 = (u0 + 1).min(STYLE_U as usize - 1);
+    let v1 = (v0 + 1).min(STYLE_V as usize - 1);
+    let tu = u - u0 as f32;
+    let tv = v - v0 as f32;
+    let at = |iu: usize, iv: usize| {
+        let texel = style[(layer * STYLE_V as usize + iv) * STYLE_U as usize + iu];
+        Vec3::new(texel[0], texel[1], texel[2])
+    };
+    let c0 = at(u0, v0).lerp(at(u1, v0), tu);
+    let c1 = at(u0, v1).lerp(at(u1, v1), tu);
+    c0.lerp(c1, tv)
+}
+
+/// Distance from styled quad samples to the strands. The rasterizer draws these
+/// samples, so a cage-only check would miss a styling residual that leaves the groom.
+fn worst_quad_gap(strands: &[Vec<Vec3>]) -> (usize, Vec3, f32) {
+    let frames = frames_for(strands);
+    let mut sum = vec![Vec3::ZERO; STYLE_TEXELS as usize];
+    let mut weight = vec![0.0f32; STYLE_TEXELS as usize];
+    for strand in strands {
+        let uv = frames[0].uv(strand[0]);
+        for (layer, point) in strand.iter().enumerate() {
+            let residual = *point - bilinear(frames[layer].quad(), uv);
+            splat_residual(&mut sum, &mut weight, uv, layer, residual);
+        }
+    }
+    let mut style = vec![[0.0f32; 4]; STYLE_TEXELS as usize];
+    for (texel, (accumulated, weight)) in style.iter_mut().zip(sum.iter().zip(&weight)) {
+        if *weight > 0.0 {
+            let residual = *accumulated / *weight;
+            *texel = [residual.x, residual.y, residual.z, 0.0];
+        }
+    }
+
+    let mut worst_layer = 0usize;
+    let mut worst_axis = frames[0].axis_u;
+    let mut worst = 0.0f32;
+    for (layer, frame) in frames.iter().enumerate() {
+        let quad = frame.quad();
+        let mut gap = 0.0f32;
+        for v in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            for u in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let uv = Vec2::new(u, v);
+                let pos = bilinear(quad, uv) + style_slice(&style, uv, layer);
+                let mut nearest = f32::MAX;
+                for strand in strands {
+                    nearest = nearest.min(pos.distance_squared(strand[layer]));
+                }
+                gap = gap.max(nearest);
+            }
+        }
+        gap = gap.sqrt();
+        if gap > worst {
+            worst = gap;
+            worst_layer = layer;
+            worst_axis = if frame.ext_u >= frame.ext_v {
+                frame.axis_u
+            } else {
+                frame.axis_v
+            };
+        }
+    }
+    (worst_layer, worst_axis, worst)
+}
+
+fn split_until_coherent(strands: &HairStrands, group: &[usize]) -> Vec<Vec<usize>> {
+    fn rec(strands: &HairStrands, group: &[usize], depth: u32) -> Vec<Vec<usize>> {
+        let indexed = resample_indexed(strands, group);
+        if indexed.is_empty() {
+            return Vec::new();
+        }
+        if indexed.len() < 2 || depth >= 16 {
+            return vec![indexed.into_iter().map(|(id, _)| id).collect()];
+        }
+        let resampled: Vec<Vec<Vec3>> =
+            indexed.iter().map(|(_, samples)| samples.clone()).collect();
+        let (layer, axis, gap) = worst_quad_gap(&resampled);
+        if gap <= MAX_QUAD_GAP {
+            return vec![indexed.into_iter().map(|(id, _)| id).collect()];
+        }
+        let mean = average(
+            &resampled
+                .iter()
+                .map(|samples| samples[layer])
+                .collect::<Vec<_>>(),
+        );
+        let mut order: Vec<(f32, usize)> = indexed
+            .iter()
+            .map(|(strand, samples)| ((samples[layer] - mean).dot(axis), *strand))
+            .collect();
+        order.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let span = order[order.len() - 1].0 - order[0].0;
+        let mid = order.len() / 2;
+        if span < 1e-3 || mid == 0 {
+            return vec![group.to_vec()];
+        }
+        let left: Vec<usize> = order[..mid].iter().map(|entry| entry.1).collect();
+        let right: Vec<usize> = order[mid..].iter().map(|entry| entry.1).collect();
+        let mut out = rec(strands, &left, depth + 1);
+        out.extend(rec(strands, &right, depth + 1));
+        out
+    }
+    rec(strands, group, 0)
 }
 
 fn bilinear(quad: [Vec3; 4], uv: Vec2) -> Vec3 {
     let u = uv.x;
     let v = uv.y;
-    quad[0] * (1.0 - u) * (1.0 - v) + quad[1] * u * (1.0 - v) + quad[2] * (1.0 - u) * v + quad[3] * u * v
+    quad[0] * (1.0 - u) * (1.0 - v)
+        + quad[1] * u * (1.0 - v)
+        + quad[2] * (1.0 - u) * v
+        + quad[3] * u * v
 }
 
 fn splat_residual(sum: &mut [Vec3], weight: &mut [f32], uv: Vec2, layer: usize, residual: Vec3) {
@@ -404,9 +562,12 @@ fn bake_ambient_occlusion(corners: &mut [CageCorner], bundles: &[BundleDesc]) {
     }
     let extent = (max - min).max(Vec3::splat(1.0));
     let cell = extent.max_element() / 24.0;
-    let mut grid: std::collections::HashMap<(i32, i32, i32), Vec<usize>> = std::collections::HashMap::new();
+    let mut grid: std::collections::HashMap<(i32, i32, i32), Vec<usize>> =
+        std::collections::HashMap::new();
     for (index, corner) in corners.iter().enumerate() {
-        grid.entry(voxel(corner.position, min, cell)).or_default().push(index);
+        grid.entry(voxel(corner.position, min, cell))
+            .or_default()
+            .push(index);
     }
 
     let mut ao = vec![1.0f32; corners.len()];
@@ -546,7 +707,11 @@ mod tests {
         };
         let mesh = bake_hair_mesh(&hair);
         assert_eq!(mesh.bundles.len(), 1);
-        assert!(mesh.corners.iter().all(|c| c.position.is_finite() && c.tangent.is_finite()));
+        assert!(
+            mesh.corners
+                .iter()
+                .all(|c| c.position.is_finite() && c.tangent.is_finite())
+        );
         let max_residual = mesh
             .style
             .iter()
@@ -556,5 +721,300 @@ mod tests {
             max_residual < 1e-2,
             "expected the cage to match the corner strands, residual {max_residual}"
         );
+    }
+
+    #[test]
+    fn diverging_strands_are_not_bridged() {
+        let mut points = Vec::new();
+        let mut strands = Vec::new();
+        for side in [-1.0f32, 1.0] {
+            for i in 0..16 {
+                let start = points.len() as u32;
+                let tip = Vec3::new(side * 30.0, (i as f32 - 7.5) * 0.15, -40.0);
+                for layer in 0..16 {
+                    let t = layer as f32 / 15.0;
+                    points.push(Vec3::ZERO.lerp(tip, t));
+                }
+                strands.push((start, 16));
+            }
+        }
+        let hair = HairStrands {
+            points: points.clone(),
+            strands: strands.clone(),
+            default_color: [1.0, 1.0, 1.0],
+        };
+        let mesh = bake_hair_mesh(&hair);
+        assert!(
+            mesh.bundles.len() > 1,
+            "the two locks should not share one quad"
+        );
+        let stray = max_styled_stray(&mesh, &points, &strands);
+        assert!(
+            stray.distance < 8.0,
+            "uniform samples inside a bundle quad left the groom by {}",
+            stray.distance
+        );
+    }
+
+    #[test]
+    fn bent_bundle_keeps_its_cross_section() {
+        let mut points = Vec::new();
+        let mut strands = Vec::new();
+        for i in 0..4 {
+            for j in 0..4 {
+                let start = points.len() as u32;
+                let root = Vec3::new(i as f32 * 0.4, j as f32 * 0.4, 0.0);
+                for layer in 0..16 {
+                    let angle = layer as f32 / 15.0 * std::f32::consts::FRAC_PI_2;
+                    points.push(
+                        root + Vec3::new(20.0 * (1.0 - angle.cos()), 0.0, 20.0 * angle.sin()),
+                    );
+                }
+                strands.push((start, 16));
+            }
+        }
+        let hair = HairStrands {
+            points: points.clone(),
+            strands: strands.clone(),
+            default_color: [1.0, 1.0, 1.0],
+        };
+        let mesh = bake_hair_mesh(&hair);
+        let stray = max_styled_stray(&mesh, &points, &strands);
+        assert!(
+            stray.distance < 8.0,
+            "a bending lock inflated its quad, stray {}",
+            stray.distance
+        );
+    }
+
+    #[test]
+    fn baked_grooms_stay_on_the_source_strands() {
+        for file in ["wStraight.hair", "wWavy.hair", "wCurly.hair"] {
+            let path = format!("{}/assets/hair/{file}", env!("CARGO_MANIFEST_DIR"));
+            let hair = crate::hair_file::load_hair_path(&path).unwrap_or_else(|err| {
+                panic!("failed to read {path}: {err}");
+            });
+            let mesh = bake_hair_mesh(&hair);
+            let stray = max_styled_stray(&mesh, &hair.points, &hair.strands);
+            assert!(
+                stray.distance < 8.0,
+                "{file} leaves the source groom by {:.1} at bundle {} ({} strands) uv {:?} w {:.3} pos {:?} ({} bundles)",
+                stray.distance,
+                stray.bundle,
+                mesh.bundles[stray.bundle].strand_count,
+                stray.uv,
+                stray.w,
+                stray.position,
+                mesh.bundles.len()
+            );
+        }
+    }
+
+    struct Stray {
+        distance: f32,
+        bundle: usize,
+        uv: Vec2,
+        w: f32,
+        position: Vec3,
+    }
+
+    fn max_styled_stray(mesh: &HairMesh, points: &[Vec3], strands: &[(u32, u32)]) -> Stray {
+        // Upper bound on the distance from styled samples to the source polylines.
+        // A sample stops once it is within the acceptance distance: that bound is
+        // enough to prove it did not grow a flyaway.
+        let limit = 8.0f32;
+        let cell = 4.0f32;
+        let mut origin = Vec3::splat(f32::MAX);
+        for point in points {
+            origin = origin.min(*point);
+        }
+        let mut bins: std::collections::HashMap<(i32, i32, i32), Vec<(Vec3, Vec3)>> =
+            std::collections::HashMap::new();
+        let voxel = |p: Vec3| {
+            let q = (p - origin) / cell;
+            (q.x.floor() as i32, q.y.floor() as i32, q.z.floor() as i32)
+        };
+        for &(start, count) in strands {
+            let start = start as usize;
+            let count = count as usize;
+            for i in 1..count {
+                let a = points[start + i - 1];
+                let b = points[start + i];
+                let ka = voxel(a);
+                let kb = voxel(b);
+                for z in ka.2.min(kb.2)..=ka.2.max(kb.2) {
+                    for y in ka.1.min(kb.1)..=ka.1.max(kb.1) {
+                        for x in ka.0.min(kb.0)..=ka.0.max(kb.0) {
+                            bins.entry((x, y, z)).or_default().push((a, b));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut worst = Stray {
+            distance: 0.0,
+            bundle: 0,
+            uv: Vec2::ZERO,
+            w: 0.0,
+            position: Vec3::ZERO,
+        };
+        let uvs = [0.0f32, 0.25, 0.5, 0.75, 1.0];
+        for (bundle_index, bundle) in mesh.bundles.iter().enumerate() {
+            for &v in &uvs {
+                for &u in &uvs {
+                    let uv = Vec2::new(u, v);
+                    for step in 0..(LAYER_COUNT as usize * 2 - 1) {
+                        let w = step as f32 / (LAYER_COUNT as f32 * 2.0 - 2.0);
+                        let pos = styled_position(mesh, bundle, uv, w);
+                        let nearest = nearest_segment(&bins, voxel(pos), pos, limit, cell);
+                        if nearest > worst.distance {
+                            worst = Stray {
+                                distance: nearest,
+                                bundle: bundle_index,
+                                uv,
+                                w,
+                                position: pos,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        worst
+    }
+
+    fn styled_position(mesh: &HairMesh, bundle: &BundleDesc, uv: Vec2, w: f32) -> Vec3 {
+        let layers_f = w * (LAYER_COUNT - 1) as f32;
+        let i0 = (layers_f.floor() as usize).min(LAYER_COUNT as usize - 1);
+        let i1 = (i0 + 1).min(LAYER_COUNT as usize - 1);
+        let t = layers_f - i0 as f32;
+        let off = bundle.layer_offset as usize;
+        let p0 = cage_point(mesh, off, i0, uv);
+        let p1 = cage_point(mesh, off, i1, uv);
+        let m0 = cage_tangent(mesh, off, i0, uv);
+        let m1 = cage_tangent(mesh, off, i1, uv);
+        hermite(p0, p1, m0, m1, t) + sample_style(mesh, bundle.style_offset as usize, uv, w)
+    }
+
+    fn cage_point(mesh: &HairMesh, offset: usize, layer: usize, uv: Vec2) -> Vec3 {
+        let i = offset + layer * 4;
+        bilinear(
+            [
+                mesh.corners[i].position,
+                mesh.corners[i + 1].position,
+                mesh.corners[i + 2].position,
+                mesh.corners[i + 3].position,
+            ],
+            uv,
+        )
+    }
+
+    fn cage_tangent(mesh: &HairMesh, offset: usize, layer: usize, uv: Vec2) -> Vec3 {
+        let curr = cage_point(mesh, offset, layer, uv);
+        let prev = cage_point(mesh, offset, layer.saturating_sub(1), uv);
+        let next = cage_point(mesh, offset, (layer + 1).min(LAYER_COUNT as usize - 1), uv);
+        let count = LAYER_COUNT as usize;
+        if layer == 0 {
+            let delta = next - curr;
+            delta.normalize_or(Vec3::Y) * delta.length().max(1e-4)
+        } else if layer + 1 >= count {
+            let delta = curr - prev;
+            delta.normalize_or(Vec3::Y) * delta.length().max(1e-4)
+        } else {
+            let delta = next - prev;
+            delta.normalize_or(Vec3::Y) * (delta.length() * 0.5).max(1e-4)
+        }
+    }
+
+    fn hermite(p0: Vec3, p1: Vec3, m0: Vec3, m1: Vec3, t: f32) -> Vec3 {
+        let t2 = t * t;
+        let t3 = t2 * t;
+        p0 * (2.0 * t3 - 3.0 * t2 + 1.0)
+            + m0 * (t3 - 2.0 * t2 + t)
+            + p1 * (-2.0 * t3 + 3.0 * t2)
+            + m1 * (t3 - t2)
+    }
+
+    fn sample_style(mesh: &HairMesh, offset: usize, uv: Vec2, w: f32) -> Vec3 {
+        let u = uv.x.clamp(0.0, 1.0) * (STYLE_U - 1) as f32;
+        let v = uv.y.clamp(0.0, 1.0) * (STYLE_V - 1) as f32;
+        let ww = w.clamp(0.0, 1.0) * (STYLE_W - 1) as f32;
+        let u0 = u.floor() as usize;
+        let v0 = v.floor() as usize;
+        let w0 = ww.floor() as usize;
+        let u1 = (u0 + 1).min(STYLE_U as usize - 1);
+        let v1 = (v0 + 1).min(STYLE_V as usize - 1);
+        let w1 = (w0 + 1).min(STYLE_W as usize - 1);
+        let tu = u - u0 as f32;
+        let tv = v - v0 as f32;
+        let tw = ww - w0 as f32;
+        let at = |iu: usize, iv: usize, iw: usize| {
+            let texel = mesh.style[offset + (iw * STYLE_V as usize + iv) * STYLE_U as usize + iu];
+            Vec3::new(texel[0], texel[1], texel[2])
+        };
+        let c00 = at(u0, v0, w0).lerp(at(u1, v0, w0), tu);
+        let c01 = at(u0, v1, w0).lerp(at(u1, v1, w0), tu);
+        let c10 = at(u0, v0, w1).lerp(at(u1, v0, w1), tu);
+        let c11 = at(u0, v1, w1).lerp(at(u1, v1, w1), tu);
+        c00.lerp(c01, tv).lerp(c10.lerp(c11, tv), tw)
+    }
+
+    fn nearest_segment(
+        bins: &std::collections::HashMap<(i32, i32, i32), Vec<(Vec3, Vec3)>>,
+        key: (i32, i32, i32),
+        pos: Vec3,
+        limit: f32,
+        cell: f32,
+    ) -> f32 {
+        let (ix, iy, iz) = key;
+        let mut nearest = f32::MAX;
+        'nearby: for radius in 0i32..=2 {
+            for dz in -radius..=radius {
+                for dy in -radius..=radius {
+                    for dx in -radius..=radius {
+                        if dx.abs().max(dy.abs()).max(dz.abs()) != radius {
+                            continue;
+                        }
+                        let Some(list) = bins.get(&(ix + dx, iy + dy, iz + dz)) else {
+                            continue;
+                        };
+                        for &(a, b) in list {
+                            nearest = nearest.min(segment_distance(pos, a, b));
+                            if nearest < limit {
+                                break 'nearby;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if nearest < limit {
+            return nearest;
+        }
+        for dz in -8i32..=8 {
+            for dy in -8i32..=8 {
+                for dx in -8i32..=8 {
+                    let Some(list) = bins.get(&(ix + dx, iy + dy, iz + dz)) else {
+                        continue;
+                    };
+                    for &(a, b) in list {
+                        nearest = nearest.min(segment_distance(pos, a, b));
+                    }
+                }
+            }
+        }
+        if nearest == f32::MAX {
+            cell * 12.0
+        } else {
+            nearest
+        }
+    }
+
+    fn segment_distance(point: Vec3, a: Vec3, b: Vec3) -> f32 {
+        let ab = b - a;
+        let denom = ab.length_squared().max(1e-8);
+        let t = ((point - a).dot(ab) / denom).clamp(0.0, 1.0);
+        point.distance(a + ab * t)
     }
 }

@@ -42,7 +42,14 @@ pub fn depth_correction(beta: f32) -> f32 {
 }
 
 /// Screen AABB is completely outside the viewport.
-pub fn aabb_outside_viewport(min_x: f32, min_y: f32, max_x: f32, max_y: f32, width: f32, height: f32) -> bool {
+pub fn aabb_outside_viewport(
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+    width: f32,
+    height: f32,
+) -> bool {
     max_x < 0.0 || max_y < 0.0 || min_x > width || min_y > height
 }
 
@@ -70,7 +77,11 @@ mod tests {
     fn control_points_snap_to_power_of_two_plus_one() {
         let full = control_point_count(1.0, 16);
         assert!(full >= 3);
-        assert_eq!((full - 1).count_ones(), 1, "C-1 is a power of two, got {full}");
+        assert_eq!(
+            (full - 1).count_ones(),
+            1,
+            "C-1 is a power of two, got {full}"
+        );
         assert!(full <= 127);
         let low = control_point_count(0.0, 16);
         // C_raw is at least the layer count, then snapped.
@@ -80,7 +91,9 @@ mod tests {
 
     #[test]
     fn viewport_cull() {
-        assert!(aabb_outside_viewport(-10.0, -10.0, -1.0, -1.0, 100.0, 100.0));
+        assert!(aabb_outside_viewport(
+            -10.0, -10.0, -1.0, -1.0, 100.0, 100.0
+        ));
         assert!(!aabb_outside_viewport(-10.0, -10.0, 5.0, 5.0, 100.0, 100.0));
     }
 

@@ -16,11 +16,11 @@ use std::time::Instant;
 use bevy::camera::Hdr;
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
+use bevy::render::RenderPlugin;
 use bevy::render::render_resource::{TextureUsages, WgpuFeatures};
 use bevy::render::settings::WgpuSettings;
-use bevy::render::RenderPlugin;
 use bevy_camera_controller::free_camera::{FreeCamera, FreeCameraPlugin};
-use bevy_hair::{bake_hair_mesh, load_hair_path, load_obj_path, HairGroom, HairMesh, HairPlugin};
+use bevy_hair::{HairGroom, HairMesh, HairPlugin, bake_hair_mesh, load_hair_path, load_obj_path};
 
 const GROOM_FILES: [&str; 3] = ["wStraight.hair", "wWavy.hair", "wCurly.hair"];
 const GROOM_NAMES: [&str; 3] = ["straight", "wavy", "curly"];
@@ -115,20 +115,17 @@ fn setup(
     mut hair: ResMut<Assets<HairMesh>>,
 ) {
     let handles = [
-        hair.add(std::mem::replace(
-            &mut prepared.grooms[0],
-            empty_groom(),
-        )),
-        hair.add(std::mem::replace(
-            &mut prepared.grooms[1],
-            empty_groom(),
-        )),
-        hair.add(std::mem::replace(
-            &mut prepared.grooms[2],
-            empty_groom(),
-        )),
+        hair.add(std::mem::replace(&mut prepared.grooms[0], empty_groom())),
+        hair.add(std::mem::replace(&mut prepared.grooms[1], empty_groom())),
+        hair.add(std::mem::replace(&mut prepared.grooms[2], empty_groom())),
     ];
-    let head = std::mem::replace(&mut prepared.head, Mesh::new(bevy::mesh::PrimitiveTopology::TriangleList, bevy::asset::RenderAssetUsages::default()));
+    let head = std::mem::replace(
+        &mut prepared.head,
+        Mesh::new(
+            bevy::mesh::PrimitiveTopology::TriangleList,
+            bevy::asset::RenderAssetUsages::default(),
+        ),
+    );
 
     // The Cem Yuksel grooms are Z-up. Bevy is Y-up.
     let model = Transform::from_rotation(Quat::from_rotation_x(-FRAC_PI_2));
@@ -149,10 +146,7 @@ fn setup(
         },
         model,
     ));
-    commands.insert_resource(GroomLibrary {
-        handles,
-        active: 0,
-    });
+    commands.insert_resource(GroomLibrary { handles, active: 0 });
 
     commands.spawn((
         Camera3d {

@@ -89,10 +89,14 @@ fn box_downsample(src: &[[f32; 4]], width: usize, height: usize) -> Vec<[f32; 4]
 pub fn studio_env(dir: Vec3) -> Vec3 {
     let dir = dir.normalize_or_zero();
     let up = dir.y.clamp(0.0, 1.0);
-    let sky = Vec3::new(0.45, 0.55, 0.7) * (0.35 + 0.65 * up) + Vec3::new(0.18, 0.14, 0.11) * (1.0 - up);
+    let sky =
+        Vec3::new(0.45, 0.55, 0.7) * (0.35 + 0.65 * up) + Vec3::new(0.18, 0.14, 0.11) * (1.0 - up);
     let sun_dir = Vec3::new(0.35, 0.82, 0.45).normalize();
     let sun = dir.dot(sun_dir).max(0.0).powf(64.0);
-    let fill = dir.dot(Vec3::new(-0.6, 0.2, 0.4).normalize()).max(0.0).powf(8.0);
+    let fill = dir
+        .dot(Vec3::new(-0.6, 0.2, 0.4).normalize())
+        .max(0.0)
+        .powf(8.0);
     sky + Vec3::new(1.15, 0.95, 0.75) * sun * 6.0 + Vec3::new(0.45, 0.55, 0.8) * fill * 0.8
 }
 

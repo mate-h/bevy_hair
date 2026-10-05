@@ -13,9 +13,9 @@ use bevy::prelude::*;
 use bevy::render::renderer::RenderQueue;
 use bevy::render::{Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems};
 
-use crate::env::{studio_probe, Probe};
-use crate::mesh::HairMesh;
 use crate::HairGroom;
+use crate::env::{Probe, studio_probe};
+use crate::mesh::HairMesh;
 
 use pass::{GpuGroom, HairPassState};
 
@@ -33,10 +33,7 @@ impl Plugin for HairPlugin {
             .init_resource::<HairPassState>()
             .add_systems(RenderStartup, pipeline::init_pipelines)
             .add_systems(ExtractSchedule, extract_hair)
-            .add_systems(
-                Render,
-                prepare_gpu.in_set(RenderSystems::PrepareResources),
-            )
+            .add_systems(Render, prepare_gpu.in_set(RenderSystems::PrepareResources))
             .add_systems(
                 Core3d,
                 pass::hair_pass
@@ -47,9 +44,11 @@ impl Plugin for HairPlugin {
     }
 
     fn finish(&self, app: &mut App) {
-        let Some(handles) = app.world_mut().get_resource_mut::<Assets<Shader>>().map(|mut shaders| {
-            pipeline::load_shaders(&mut shaders)
-        }) else {
+        let Some(handles) = app
+            .world_mut()
+            .get_resource_mut::<Assets<Shader>>()
+            .map(|mut shaders| pipeline::load_shaders(&mut shaders))
+        else {
             return;
         };
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
@@ -149,7 +148,9 @@ fn prepare_gpu(
         let Some(mesh) = extracted.meshes.get(&groom.asset) else {
             continue;
         };
-        state.grooms.insert(groom.asset, GpuGroom::upload(&device, &queue, mesh));
+        state
+            .grooms
+            .insert(groom.asset, GpuGroom::upload(&device, &queue, mesh));
     }
 }
 

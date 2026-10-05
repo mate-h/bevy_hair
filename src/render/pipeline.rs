@@ -21,18 +21,48 @@ pub struct HairShaderHandles {
 
 pub fn load_shaders(shaders: &mut Assets<Shader>) -> HairShaderHandles {
     HairShaderHandles {
-        clear: shader(shaders, "hair_clear.wgsl", include_str!("shaders/clear.wgsl"), false),
+        clear: shader(
+            shaders,
+            "hair_clear.wgsl",
+            include_str!("shaders/clear.wgsl"),
+            false,
+        ),
         clear_dom: shader(
             shaders,
             "hair_clear_dom.wgsl",
             include_str!("shaders/clear_dom.wgsl"),
             false,
         ),
-        lod: shader(shaders, "hair_lod.wgsl", include_str!("shaders/lod.wgsl"), true),
-        scan: shader(shaders, "hair_scan.wgsl", include_str!("shaders/scan.wgsl"), true),
-        raster: shader(shaders, "hair_raster.wgsl", include_str!("shaders/raster.wgsl"), true),
-        shade: shader(shaders, "hair_shade.wgsl", include_str!("shaders/shade.wgsl"), true),
-        filter: shader(shaders, "hair_filter.wgsl", include_str!("shaders/filter.wgsl"), true),
+        lod: shader(
+            shaders,
+            "hair_lod.wgsl",
+            include_str!("shaders/lod.wgsl"),
+            true,
+        ),
+        scan: shader(
+            shaders,
+            "hair_scan.wgsl",
+            include_str!("shaders/scan.wgsl"),
+            true,
+        ),
+        raster: shader(
+            shaders,
+            "hair_raster.wgsl",
+            include_str!("shaders/raster.wgsl"),
+            true,
+        ),
+        shade: shader(
+            shaders,
+            "hair_shade.wgsl",
+            include_str!("shaders/shade.wgsl"),
+            true,
+        ),
+        filter: shader(
+            shaders,
+            "hair_filter.wgsl",
+            include_str!("shaders/filter.wgsl"),
+            true,
+        ),
         composite: shader(
             shaders,
             "hair_composite.wgsl",
@@ -82,10 +112,7 @@ pub fn init_pipelines(
 
     let clear_layout = BindGroupLayoutDescriptor::new(
         "hair_clear",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (rw(8), rw(8), rw(4)),
-        ),
+        &BindGroupLayoutEntries::sequential(ShaderStages::COMPUTE, (rw(8), rw(8), rw(4))),
     );
     let clear_dom_layout = BindGroupLayoutDescriptor::new(
         "hair_clear_dom",
@@ -145,14 +172,15 @@ pub fn init_pipelines(
         ),
     );
 
-    let queue = |label: &'static str, layout: &BindGroupLayoutDescriptor, shader: &Handle<Shader>| {
-        pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            label: Some(label.into()),
-            layout: vec![layout.clone()],
-            shader: shader.clone(),
-            ..default()
-        })
-    };
+    let queue =
+        |label: &'static str, layout: &BindGroupLayoutDescriptor, shader: &Handle<Shader>| {
+            pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some(label.into()),
+                layout: vec![layout.clone()],
+                shader: shader.clone(),
+                ..default()
+            })
+        };
 
     let pipelines = HairPipelines {
         clear: queue("hair_clear", &clear_layout, &clear),

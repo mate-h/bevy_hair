@@ -1,8 +1,8 @@
 //! Minimal Wavefront OBJ loader for the example head mesh.
 
 use bevy::asset::RenderAssetUsages;
-use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
 use bevy::math::Vec3;
+use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
 
 pub fn load_obj_path(path: impl AsRef<std::path::Path>) -> Result<Mesh, std::io::Error> {
     let text = std::fs::read_to_string(path)?;
@@ -68,7 +68,10 @@ pub fn parse_obj(text: &str) -> Mesh {
         *normal = v.to_array();
     }
 
-    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
     mesh.insert_indices(Indices::U32(indices));

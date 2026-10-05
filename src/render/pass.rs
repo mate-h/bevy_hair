@@ -8,10 +8,10 @@ use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery
 use bevy::render::view::{ViewDepthTexture, ViewTarget};
 use bytemuck::{Pod, Zeroable};
 
-use crate::env::{Probe, ENV_MIPS};
+use crate::env::{ENV_MIPS, Probe};
 use crate::mesh::{HairMesh, LAYER_COUNT};
-use crate::render::pipeline::{queue_composite, HairPipelines};
-use crate::render::{flag, ExtractedFrame};
+use crate::render::pipeline::{HairPipelines, queue_composite};
+use crate::render::{ExtractedFrame, flag};
 
 pub const DOM_SIZE: u32 = 512;
 
@@ -107,11 +107,31 @@ impl GpuGroom {
             strand_count,
             bounds_min: mesh.bounds_min,
             bounds_max: mesh.bounds_max,
-            camera_lod: zeros(device, "hair_lod", bundle_count as u64 * 16, BufferKind::Storage),
-            camera_refs: zeros(device, "hair_refs", strand_count as u64 * 16, BufferKind::Storage),
+            camera_lod: zeros(
+                device,
+                "hair_lod",
+                bundle_count as u64 * 16,
+                BufferKind::Storage,
+            ),
+            camera_refs: zeros(
+                device,
+                "hair_refs",
+                strand_count as u64 * 16,
+                BufferKind::Storage,
+            ),
             camera_indirect: zeros(device, "hair_indirect", 16, BufferKind::Indirect),
-            dom_lod: zeros(device, "hair_dom_lod", bundle_count as u64 * 16, BufferKind::Storage),
-            dom_refs: zeros(device, "hair_dom_refs", strand_count as u64 * 16, BufferKind::Storage),
+            dom_lod: zeros(
+                device,
+                "hair_dom_lod",
+                bundle_count as u64 * 16,
+                BufferKind::Storage,
+            ),
+            dom_refs: zeros(
+                device,
+                "hair_dom_refs",
+                strand_count as u64 * 16,
+                BufferKind::Storage,
+            ),
             dom_indirect: zeros(device, "hair_dom_indirect", 16, BufferKind::Indirect),
             camera_params: zeros(
                 device,
@@ -290,7 +310,11 @@ pub fn hair_pass(
         return;
     };
 
-    let depth_view = if depth.texture.usage().contains(TextureUsages::TEXTURE_BINDING) {
+    let depth_view = if depth
+        .texture
+        .usage()
+        .contains(TextureUsages::TEXTURE_BINDING)
+    {
         depth.view()
     } else {
         state.frame.dummy_depth.as_ref().unwrap()
@@ -313,10 +337,12 @@ pub fn hair_pass(
                     targets.beta.as_entire_binding(),
                 )),
             );
-            let mut pass = ctx.command_encoder().begin_compute_pass(&ComputePassDescriptor {
-                label: Some("hair_clear"),
-                ..default()
-            });
+            let mut pass = ctx
+                .command_encoder()
+                .begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("hair_clear"),
+                    ..default()
+                });
             pass.set_pipeline(clear);
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(pixels.div_ceil(256), 1, 1);
@@ -421,10 +447,12 @@ pub fn hair_pass(
                     &cache.get_bind_group_layout(&pipelines.clear_dom_layout),
                     &BindGroupEntries::sequential((targets.dom.as_entire_binding(),)),
                 );
-                let mut pass = ctx.command_encoder().begin_compute_pass(&ComputePassDescriptor {
-                    label: Some("hair_clear_dom"),
-                    ..default()
-                });
+                let mut pass = ctx
+                    .command_encoder()
+                    .begin_compute_pass(&ComputePassDescriptor {
+                        label: Some("hair_clear_dom"),
+                        ..default()
+                    });
                 pass.set_pipeline(clear_dom);
                 pass.set_bind_group(0, &group, &[]);
                 pass.dispatch_workgroups(dom_pixels.div_ceil(256), 1, 1);
@@ -622,7 +650,10 @@ fn mip_words(sizes: &[(u32, u32); ENV_MIPS]) -> [[u32; 4]; 4] {
     words
 }
 
-fn light_fit(gpu: &GpuGroom, lights: &[crate::render::ExtractedLight]) -> (Vec3, Vec3, Mat4, f32, f32) {
+fn light_fit(
+    gpu: &GpuGroom,
+    lights: &[crate::render::ExtractedLight],
+) -> (Vec3, Vec3, Mat4, f32, f32) {
     let center = (gpu.bounds_min + gpu.bounds_max) * 0.5;
     let extent = (gpu.bounds_max - gpu.bounds_min).max(Vec3::splat(1.0));
     let radius = extent.length().max(1.0);
@@ -712,21 +743,23 @@ fn ensure_dummy_depth(device: &RenderDevice, ctx: &mut RenderContext, frame: &mu
     });
     let view = texture.create_view(&TextureViewDescriptor::default());
     {
-        let _pass = ctx.command_encoder().begin_render_pass(&RenderPassDescriptor {
-            label: Some("hair_dummy_depth_clear"),
-            color_attachments: &[],
-            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
-                view: &view,
-                depth_ops: Some(Operations {
-                    load: LoadOp::Clear(0.0),
-                    store: StoreOp::Store,
+        let _pass = ctx
+            .command_encoder()
+            .begin_render_pass(&RenderPassDescriptor {
+                label: Some("hair_dummy_depth_clear"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                    view: &view,
+                    depth_ops: Some(Operations {
+                        load: LoadOp::Clear(0.0),
+                        store: StoreOp::Store,
+                    }),
+                    stencil_ops: None,
                 }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
     }
     frame.dummy_depth = Some(view);
     let _ = texture;
@@ -774,13 +807,15 @@ fn dispatch<const N: usize>(
     entries: BindGroupEntries<'_, N>,
     groups: (u32, u32, u32),
 ) {
-    let group = ctx
-        .render_device()
-        .create_bind_group(None, &cache.get_bind_group_layout(layout), &entries);
-    let mut pass = ctx.command_encoder().begin_compute_pass(&ComputePassDescriptor {
-        label: Some("hair"),
-        ..default()
-    });
+    let group =
+        ctx.render_device()
+            .create_bind_group(None, &cache.get_bind_group_layout(layout), &entries);
+    let mut pass = ctx
+        .command_encoder()
+        .begin_compute_pass(&ComputePassDescriptor {
+            label: Some("hair"),
+            ..default()
+        });
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, &group, &[]);
     pass.dispatch_workgroups(groups.0, groups.1, groups.2);
@@ -814,10 +849,12 @@ fn dispatch_raster(
             depth_view,
         )),
     );
-    let mut pass = ctx.command_encoder().begin_compute_pass(&ComputePassDescriptor {
-        label: Some("hair_raster"),
-        ..default()
-    });
+    let mut pass = ctx
+        .command_encoder()
+        .begin_compute_pass(&ComputePassDescriptor {
+            label: Some("hair_raster"),
+            ..default()
+        });
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, &group, &[]);
     pass.dispatch_workgroups_indirect(indirect, 0);

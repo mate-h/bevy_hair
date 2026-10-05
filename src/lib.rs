@@ -17,7 +17,7 @@ mod render;
 use bevy::prelude::*;
 
 pub use bake::bake_hair_mesh;
-pub use hair_file::{load_hair_path, parse_hair, HairError, HairStrands};
+pub use hair_file::{HairError, HairStrands, load_hair_path, parse_hair};
 pub use mesh::HairMesh;
 pub use obj::load_obj_path;
 pub use render::HairPlugin;
