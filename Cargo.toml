@@ -1,0 +1,18 @@
+[package]
+name = "bevy_hair"
+version = "0.1.0"
+edition = "2024"
+description = "Deferred software rasterization for real-time strand hair (Lipp et al. 2026)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+bevy = { version = "0.19.1", features = ["3d"] }
+bytemuck = { version = "1", features = ["derive"] }
+
+[[example]]
+name = "groom"
+path = "examples/groom.rs"
+
+[dev-dependencies]
+naga = { version = "29.0.4", features = ["wgsl-in"] }
