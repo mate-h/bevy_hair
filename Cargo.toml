@@ -15,4 +15,5 @@ name = "groom"
 path = "examples/groom.rs"
 
 [dev-dependencies]
+bevy_camera_controller = { version = "0.19.1", features = ["free_camera"] }
 naga = { version = "29.0.4", features = ["wgsl-in"] }

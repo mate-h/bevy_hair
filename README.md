@@ -16,7 +16,10 @@ The first launch bakes three grooms on the CPU before the window opens.
 
 | Key | Action |
 | --- | --- |
-| drag / scroll | orbit and zoom |
+| right-drag | look around |
+| WASD / Q E | move, and rise or fall |
+| scroll | change fly speed |
+| shift | move faster |
 | 1 / 2 / 3 | straight, wavy, curly |
 | L | level of detail |
 | F | reconnection filter |

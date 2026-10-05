@@ -1,23 +1,25 @@
-//! Orbit the Cem Yuksel woman grooms through the deferred hair rasterizer.
+//! Fly around the Cem Yuksel woman grooms through the deferred hair rasterizer.
 //!
 //! ```text
 //! cargo run --example groom
 //! ```
 //!
-//! Drag to orbit, scroll to zoom. Keys: 1/2/3 switch grooms, L/F/O/D toggle
-//! LOD, the reconnection filter, ambient occlusion, and the deep opacity map,
-//! and `[` / `]` change lambda.
+//! Right-drag to look, WASD to move, Q/E to rise and fall, scroll to change
+//! speed. Keys: 1/2/3 switch grooms, L/F/O/D toggle LOD, the reconnection
+//! filter, ambient occlusion, and the deep opacity map, and `[` / `]` change
+//! lambda.
 
+use std::f32::consts::FRAC_PI_2;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use bevy::camera::Hdr;
-use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
 use bevy::render::render_resource::{TextureUsages, WgpuFeatures};
 use bevy::render::settings::WgpuSettings;
 use bevy::render::RenderPlugin;
+use bevy_camera_controller::free_camera::{FreeCamera, FreeCameraPlugin};
 use bevy_hair::{bake_hair_mesh, load_hair_path, load_obj_path, HairGroom, HairMesh, HairPlugin};
 
 const GROOM_FILES: [&str; 3] = ["wStraight.hair", "wWavy.hair", "wCurly.hair"];
@@ -46,11 +48,11 @@ fn main() {
                     ..default()
                 }),
         )
-        .add_plugins(HairPlugin)
+        .add_plugins((HairPlugin, FreeCameraPlugin))
         .insert_resource(ClearColor(Color::srgb(0.04, 0.045, 0.05)))
         .insert_resource(prepared)
         .add_systems(Startup, setup)
-        .add_systems(Update, (orbit, controls, hud))
+        .add_systems(Update, (controls, hud))
         .run();
 }
 
@@ -64,14 +66,6 @@ struct Prepared {
 struct GroomLibrary {
     handles: [Handle<HairMesh>; 3],
     active: usize,
-}
-
-#[derive(Component)]
-struct Orbit {
-    yaw: f32,
-    pitch: f32,
-    distance: f32,
-    target: Vec3,
 }
 
 fn prepare_assets() -> Prepared {
@@ -136,7 +130,9 @@ fn setup(
     ];
     let head = std::mem::replace(&mut prepared.head, Mesh::new(bevy::mesh::PrimitiveTopology::TriangleList, bevy::asset::RenderAssetUsages::default()));
 
-    let target = Vec3::new(-5.0, 8.0, 0.0);
+    // The Cem Yuksel grooms are Z-up. Bevy is Y-up.
+    let model = Transform::from_rotation(Quat::from_rotation_x(-FRAC_PI_2));
+    let focus = Vec3::new(-5.0, 15.0, 0.0);
     commands.spawn((
         Mesh3d(meshes.add(head)),
         MeshMaterial3d(materials.add(StandardMaterial {
@@ -144,25 +140,20 @@ fn setup(
             perceptual_roughness: 0.65,
             ..default()
         })),
+        model,
     ));
     commands.spawn((
         HairGroom {
             mesh: handles[0].clone(),
             ..default()
         },
-        Transform::default(),
+        model,
     ));
     commands.insert_resource(GroomLibrary {
         handles,
         active: 0,
     });
 
-    let orbit = Orbit {
-        yaw: 0.4,
-        pitch: 0.15,
-        distance: 170.0,
-        target,
-    };
     commands.spawn((
         Camera3d {
             depth_texture_usages: (TextureUsages::RENDER_ATTACHMENT
@@ -172,13 +163,19 @@ fn setup(
         },
         Hdr,
         Msaa::Off,
-        orbit_transform(&orbit),
-        orbit,
+        Transform::from_xyz(focus.x + 150.0, focus.y + 18.0, focus.z + 40.0)
+            .looking_at(focus, Vec3::Y),
+        FreeCamera {
+            // The head is about 120 units tall.
+            walk_speed: 40.0,
+            run_speed: 120.0,
+            ..default()
+        },
     ));
 
-    let key = target + Vec3::new(40.0, 90.0, 70.0);
-    let fill = target + Vec3::new(-80.0, 40.0, 50.0);
-    let rim = target + Vec3::new(20.0, 30.0, -90.0);
+    let key = focus + Vec3::new(70.0, 90.0, 50.0);
+    let fill = focus + Vec3::new(20.0, 40.0, -80.0);
+    let rim = focus + Vec3::new(-100.0, 30.0, -20.0);
     commands.spawn((
         PointLight {
             color: Color::srgb(1.0, 0.93, 0.82),
@@ -236,31 +233,6 @@ fn empty_groom() -> HairMesh {
     }
 }
 
-fn orbit(
-    mut cameras: Query<(&mut Transform, &mut Orbit), With<Camera3d>>,
-    buttons: Res<ButtonInput<MouseButton>>,
-    motion: Res<AccumulatedMouseMotion>,
-    scroll: Res<AccumulatedMouseScroll>,
-) {
-    for (mut transform, mut orbit) in &mut cameras {
-        if buttons.pressed(MouseButton::Left) {
-            orbit.yaw -= motion.delta.x * 0.005;
-            orbit.pitch = (orbit.pitch + motion.delta.y * 0.005).clamp(-1.2, 1.2);
-        }
-        orbit.distance = (orbit.distance - scroll.delta.y * 8.0).clamp(30.0, 400.0);
-        *transform = orbit_transform(&orbit);
-    }
-}
-
-fn orbit_transform(orbit: &Orbit) -> Transform {
-    let offset = Vec3::new(
-        orbit.yaw.sin() * orbit.pitch.cos(),
-        orbit.pitch.sin(),
-        orbit.yaw.cos() * orbit.pitch.cos(),
-    ) * orbit.distance;
-    Transform::from_translation(orbit.target + offset).looking_at(orbit.target, Vec3::Y)
-}
-
 fn controls(
     keys: Res<ButtonInput<KeyCode>>,
     mut grooms: Query<&mut HairGroom>,
@@ -306,7 +278,7 @@ fn hud(grooms: Query<&HairGroom>, library: Res<GroomLibrary>, mut text: Query<&m
         return;
     };
     text.0 = format!(
-        "{}\nlambda {:.1}   LOD {}   filter {}   AO {}   DOM {}\n1/2/3 groom   L F O D toggles   [ ] lambda   drag orbit",
+        "{}\nlambda {:.1}   LOD {}   filter {}   AO {}   DOM {}\n1/2/3 groom   L F O D toggles   [ ] lambda\nright-drag look   WASD move   QE up/down   scroll speed",
         GROOM_NAMES[library.active],
         groom.lambda,
         on(groom.lod),
