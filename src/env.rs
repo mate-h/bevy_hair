@@ -22,8 +22,8 @@ pub fn studio_probe() -> Probe {
     let mut width = ENV_WIDTH;
     let mut height = ENV_HEIGHT;
     let mut current = sample_latlong(width, height);
-    for mip in 0..ENV_MIPS {
-        mip_sizes[mip] = (width as u32, height as u32);
+    for (mip, size) in mip_sizes.iter_mut().enumerate() {
+        *size = (width as u32, height as u32);
         mips.extend_from_slice(&current);
         if mip + 1 == ENV_MIPS {
             break;
@@ -73,8 +73,8 @@ fn box_downsample(src: &[[f32; 4]], width: usize, height: usize) -> Vec<[f32; 4]
                     n += 1.0;
                 }
             }
-            for c in 0..4 {
-                acc[c] /= n;
+            for channel in &mut acc {
+                *channel /= n;
             }
             dst[y * dst_w + x] = acc;
         }

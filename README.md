@@ -12,7 +12,7 @@ Native wgpu is required. The example requests subgroup operations and 64-bit ato
 cargo run --example groom
 ```
 
-The first launch bakes three grooms on the CPU before the window opens.
+`cargo run --example bake` writes the three grooms to `target/groom-cache/` without opening a window. The viewer bakes any missing groom on first launch, then loads the cache until a hair file or the baker changes.
 
 | Key | Action |
 | --- | --- |

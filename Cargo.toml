@@ -11,6 +11,10 @@ bevy = { version = "0.19.1", features = ["3d"] }
 bytemuck = { version = "1", features = ["derive"] }
 
 [[example]]
+name = "bake"
+path = "examples/bake.rs"
+
+[[example]]
 name = "groom"
 path = "examples/groom.rs"
 

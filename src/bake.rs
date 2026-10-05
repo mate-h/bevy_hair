@@ -19,6 +19,22 @@ const TARGET_STRANDS_PER_CELL: f32 = 180.0;
 /// The uniform uv draw in Appendix B fills the whole quad, not just the strands.
 const MAX_QUAD_GAP: f32 = 5.0;
 
+/// Identity of this baker. On-disk groom caches should drop a mesh when it changes.
+pub const BAKE_FINGERPRINT: u64 = fnv1a_64(include_str!("bake.rs").as_bytes())
+    ^ (LAYER_COUNT as u64).wrapping_shl(32)
+    ^ STYLE_TEXELS as u64;
+
+const fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+        i += 1;
+    }
+    hash
+}
+
 pub fn bake_hair_mesh(strands: &HairStrands) -> HairMesh {
     let strand_count = strands.strands.len();
     if strand_count == 0 {
@@ -72,16 +88,17 @@ pub fn bake_hair_mesh(strands: &HairStrands) -> HairMesh {
         let y = (id as i32) / cells_side;
         let mut best = -1i32;
         let mut best_d = i32::MAX;
-        for other in 0..occupancy.len() {
-            if remap[other] != other as i32 {
+        for (other, mapped) in remap.iter().enumerate() {
+            if *mapped != other as i32 {
                 continue;
             }
-            let ox = (other as i32) % cells_side;
-            let oy = (other as i32) / cells_side;
+            let other = other as i32;
+            let ox = other % cells_side;
+            let oy = other / cells_side;
             let d = (ox - x).abs() + (oy - y).abs();
             if d < best_d {
                 best_d = d;
-                best = other as i32;
+                best = other;
             }
         }
         remap[id] = best;
@@ -681,6 +698,8 @@ mod tests {
     use crate::hair_file::HairStrands;
     use crate::mesh::STYLE_W;
 
+    type SegmentBins = std::collections::HashMap<(i32, i32, i32), Vec<(Vec3, Vec3)>>;
+
     #[test]
     fn straight_cage_residuals_are_near_zero() {
         let mut points = Vec::new();
@@ -829,8 +848,7 @@ mod tests {
         for point in points {
             origin = origin.min(*point);
         }
-        let mut bins: std::collections::HashMap<(i32, i32, i32), Vec<(Vec3, Vec3)>> =
-            std::collections::HashMap::new();
+        let mut bins = SegmentBins::new();
         let voxel = |p: Vec3| {
             let q = (p - origin) / cell;
             (q.x.floor() as i32, q.y.floor() as i32, q.z.floor() as i32)
@@ -962,7 +980,7 @@ mod tests {
     }
 
     fn nearest_segment(
-        bins: &std::collections::HashMap<(i32, i32, i32), Vec<(Vec3, Vec3)>>,
+        bins: &SegmentBins,
         key: (i32, i32, i32),
         pos: Vec3,
         limit: f32,

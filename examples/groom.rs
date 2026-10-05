@@ -8,10 +8,14 @@
 //! speed. Keys: 1/2/3 switch grooms, L/F/O/D toggle LOD, the reconnection
 //! filter, ambient occlusion, and the deep opacity map, and `[` / `]` change
 //! lambda.
+//!
+//! Baked meshes are reused from `target/groom-cache/` until the hair file or
+//! the baker changes. `cargo run --example bake` fills that cache without
+//! opening a window.
+
+mod bake;
 
 use std::f32::consts::FRAC_PI_2;
-use std::path::PathBuf;
-use std::time::Instant;
 
 use bevy::camera::Hdr;
 use bevy::pbr::StandardMaterial;
@@ -20,9 +24,8 @@ use bevy::render::RenderPlugin;
 use bevy::render::render_resource::{TextureUsages, WgpuFeatures};
 use bevy::render::settings::WgpuSettings;
 use bevy_camera_controller::free_camera::{FreeCamera, FreeCameraPlugin};
-use bevy_hair::{HairGroom, HairMesh, HairPlugin, bake_hair_mesh, load_hair_path, load_obj_path};
+use bevy_hair::{HairGroom, HairMesh, HairPlugin, load_obj_path};
 
-const GROOM_FILES: [&str; 3] = ["wStraight.hair", "wWavy.hair", "wCurly.hair"];
 const GROOM_NAMES: [&str; 3] = ["straight", "wavy", "curly"];
 
 fn main() {
@@ -69,42 +72,12 @@ struct GroomLibrary {
 }
 
 fn prepare_assets() -> Prepared {
-    let mut grooms = Vec::new();
-    for file in GROOM_FILES {
-        let path = asset_path(file);
-        eprintln!("loading {path:?}");
-        let started = Instant::now();
-        let strands = load_hair_path(&path).unwrap_or_else(|err| {
-            panic!("failed to read {}: {err}", path.display());
-        });
-        eprintln!(
-            "  {} strands, {} points",
-            strands.strands.len(),
-            strands.points.len()
-        );
-        let mesh = bake_hair_mesh(&strands);
-        eprintln!(
-            "  baked {} bundles / {} strands in {:.1}s",
-            mesh.bundles.len(),
-            mesh.strand_count(),
-            started.elapsed().as_secs_f32()
-        );
-        grooms.push(mesh);
-    }
-    let head_path = asset_path("woman.obj");
+    let grooms = bake::GROOM_FILES.map(|file| bake::load(&bake::asset_path(file)));
+    let head_path = bake::asset_path("woman.obj");
     let head = load_obj_path(&head_path).unwrap_or_else(|err| {
         panic!("failed to read {}: {err}", head_path.display());
     });
-    Prepared {
-        grooms: grooms.try_into().ok().expect("three grooms"),
-        head,
-    }
-}
-
-fn asset_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("assets/hair")
-        .join(name)
+    Prepared { grooms, head }
 }
 
 fn setup(

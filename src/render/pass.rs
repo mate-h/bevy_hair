@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use bevy::asset::AssetId;
+use bevy::ecs::system::SystemParam;
 use bevy::math::{Mat4, Vec3, Vec4};
 use bevy::prelude::*;
 use bevy::render::render_resource::*;
@@ -214,7 +215,7 @@ pub struct ScreenTargets {
     pub dom: Buffer,
 }
 
-#[derive(Resource)]
+#[derive(Default, Resource)]
 pub struct HairPassState {
     pub grooms: HashMap<AssetId<HairMesh>, GpuGroom>,
     pub frame: FrameGpu,
@@ -223,20 +224,17 @@ pub struct HairPassState {
     composite_key: Option<(TextureFormat, TextureFormat)>,
 }
 
-impl Default for HairPassState {
-    fn default() -> Self {
-        Self {
-            grooms: HashMap::new(),
-            frame: FrameGpu::default(),
-            composite_greater: None,
-            composite_less: None,
-            composite_key: None,
-        }
-    }
-}
-
 pub fn upload_env(device: &RenderDevice, probe: &Probe) -> Buffer {
     init_buffer(device, "hair_env", &probe.latlong)
+}
+
+#[derive(SystemParam)]
+pub(crate) struct HairPass<'w> {
+    pipelines: Res<'w, HairPipelines>,
+    cache: Res<'w, PipelineCache>,
+    queue: Res<'w, RenderQueue>,
+    device: Res<'w, RenderDevice>,
+    extracted: Res<'w, ExtractedFrame>,
 }
 
 pub fn hair_pass(
@@ -246,13 +244,16 @@ pub fn hair_pass(
         &ViewDepthTexture,
     )>,
     mut ctx: RenderContext,
-    pipelines: Res<HairPipelines>,
-    cache: Res<PipelineCache>,
-    queue: Res<RenderQueue>,
-    device: Res<RenderDevice>,
-    extracted: Res<ExtractedFrame>,
+    hair: HairPass,
     mut state: ResMut<HairPassState>,
 ) {
+    let HairPass {
+        pipelines,
+        cache,
+        queue,
+        device,
+        extracted,
+    } = hair;
     let (view, target, depth) = view.into_inner();
     let Some(clear) = cache.get_compute_pipeline(pipelines.clear) else {
         return;
@@ -429,12 +430,14 @@ pub fn hair_pass(
             &cache,
             raster,
             &pipelines.raster_layout,
-            gpu,
-            &gpu.camera_params,
-            &gpu.camera_refs,
-            targets,
-            depth_view,
-            &gpu.camera_indirect,
+            RasterBuffers {
+                gpu,
+                params: &gpu.camera_params,
+                refs: &gpu.camera_refs,
+                targets,
+                depth_view,
+                indirect: &gpu.camera_indirect,
+            },
         );
 
         if groom.deep_opacity {
@@ -486,12 +489,14 @@ pub fn hair_pass(
                 &cache,
                 raster,
                 &pipelines.raster_layout,
-                gpu,
-                &gpu.dom_params,
-                &gpu.dom_refs,
-                targets,
-                depth_view,
-                &gpu.dom_indirect,
+                RasterBuffers {
+                    gpu,
+                    params: &gpu.dom_params,
+                    refs: &gpu.dom_refs,
+                    targets,
+                    depth_view,
+                    indirect: &gpu.dom_indirect,
+                },
             );
         }
 
@@ -587,15 +592,8 @@ fn make_params(args: ViewArgs) -> HairParams {
         lights[i] = light.position.extend(1.0).to_array();
         colors[i] = light.color.extend(1.0).to_array();
     }
-    if args.lights.is_empty() {
-        lights[0] = args.light_eye.extend(1.0).to_array();
-    } else {
-        lights[0] = args.light_eye.extend(1.0).to_array();
-    }
-    let mut sh = [[0.0; 4]; 9];
-    for i in 0..9 {
-        sh[i] = args.sh[i].extend(0.0).to_array();
-    }
+    lights[0] = args.light_eye.extend(1.0).to_array();
+    let sh = args.sh.map(|coeff| coeff.extend(0.0).to_array());
     let mips = mip_words(args.sizes);
     HairParams {
         clip_from_world: args.clip_from_world.to_cols_array_2d(),
@@ -819,18 +817,30 @@ fn dispatch<const N: usize>(
     pass.dispatch_workgroups(groups.0, groups.1, groups.2);
 }
 
+struct RasterBuffers<'a> {
+    gpu: &'a GpuGroom,
+    params: &'a Buffer,
+    refs: &'a Buffer,
+    targets: &'a ScreenTargets,
+    depth_view: &'a TextureView,
+    indirect: &'a Buffer,
+}
+
 fn dispatch_raster(
     ctx: &mut RenderContext,
     cache: &PipelineCache,
     pipeline: &ComputePipeline,
     layout: &BindGroupLayoutDescriptor,
-    gpu: &GpuGroom,
-    params: &Buffer,
-    refs: &Buffer,
-    targets: &ScreenTargets,
-    depth_view: &TextureView,
-    indirect: &Buffer,
+    buffers: RasterBuffers<'_>,
 ) {
+    let RasterBuffers {
+        gpu,
+        params,
+        refs,
+        targets,
+        depth_view,
+        indirect,
+    } = buffers;
     let group = ctx.render_device().create_bind_group(
         None,
         &cache.get_bind_group_layout(layout),

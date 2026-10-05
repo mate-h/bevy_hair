@@ -222,34 +222,6 @@ fn rw(size: u64) -> bevy::render::render_resource::BindGroupLayoutEntryBuilder {
     storage_buffer_sized(false, NonZeroU64::new(size))
 }
 
-#[cfg(test)]
-mod shader_parse {
-    fn parse(name: &str, source: &str) {
-        naga::front::wgsl::parse_str(source).unwrap_or_else(|err| {
-            panic!("{name} failed to parse:\n{err:?}\n{err}");
-        });
-    }
-
-    fn with_common(body: &str) -> String {
-        format!("{}\n{body}", include_str!("shaders/common.wgsl"))
-    }
-
-    #[test]
-    fn shaders_parse() {
-        parse("clear", include_str!("shaders/clear.wgsl"));
-        parse("clear_dom", include_str!("shaders/clear_dom.wgsl"));
-        parse("lod", &with_common(include_str!("shaders/lod.wgsl")));
-        parse("scan", &with_common(include_str!("shaders/scan.wgsl")));
-        parse("raster", &with_common(include_str!("shaders/raster.wgsl")));
-        parse("shade", &with_common(include_str!("shaders/shade.wgsl")));
-        parse("filter", &with_common(include_str!("shaders/filter.wgsl")));
-        parse(
-            "composite",
-            &with_common(include_str!("shaders/composite.wgsl")),
-        );
-    }
-}
-
 pub fn queue_composite(
     cache: &PipelineCache,
     shader: Handle<Shader>,
@@ -288,4 +260,32 @@ pub fn queue_composite(
         multisample: MultisampleState::default(),
         ..default()
     })
+}
+
+#[cfg(test)]
+mod shader_parse {
+    fn parse(name: &str, source: &str) {
+        naga::front::wgsl::parse_str(source).unwrap_or_else(|err| {
+            panic!("{name} failed to parse:\n{err:?}\n{err}");
+        });
+    }
+
+    fn with_common(body: &str) -> String {
+        format!("{}\n{body}", include_str!("shaders/common.wgsl"))
+    }
+
+    #[test]
+    fn shaders_parse() {
+        parse("clear", include_str!("shaders/clear.wgsl"));
+        parse("clear_dom", include_str!("shaders/clear_dom.wgsl"));
+        parse("lod", &with_common(include_str!("shaders/lod.wgsl")));
+        parse("scan", &with_common(include_str!("shaders/scan.wgsl")));
+        parse("raster", &with_common(include_str!("shaders/raster.wgsl")));
+        parse("shade", &with_common(include_str!("shaders/shade.wgsl")));
+        parse("filter", &with_common(include_str!("shaders/filter.wgsl")));
+        parse(
+            "composite",
+            &with_common(include_str!("shaders/composite.wgsl")),
+        );
+    }
 }
