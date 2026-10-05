@@ -13,19 +13,16 @@ pub struct Probe {
     pub sh: [Vec3; 9],
     /// Mip 0 is the sharpest lat-long. Each texel is rgba (a = 1).
     pub latlong: Vec<[f32; 4]>,
-    pub mip_offsets: [u32; ENV_MIPS],
     pub mip_sizes: [(u32, u32); ENV_MIPS],
 }
 
 pub fn studio_probe() -> Probe {
     let mut mips = Vec::new();
-    let mut mip_offsets = [0u32; ENV_MIPS];
     let mut mip_sizes = [(0u32, 0u32); ENV_MIPS];
     let mut width = ENV_WIDTH;
     let mut height = ENV_HEIGHT;
     let mut current = sample_latlong(width, height);
     for mip in 0..ENV_MIPS {
-        mip_offsets[mip] = mips.len() as u32;
         mip_sizes[mip] = (width as u32, height as u32);
         mips.extend_from_slice(&current);
         if mip + 1 == ENV_MIPS {
@@ -39,7 +36,6 @@ pub fn studio_probe() -> Probe {
     Probe {
         sh: project_irradiance_sh(),
         latlong: mips,
-        mip_offsets,
         mip_sizes,
     }
 }

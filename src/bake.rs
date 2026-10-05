@@ -10,7 +10,7 @@ use bevy::math::{Mat3, Vec2, Vec3};
 
 use crate::hair_file::HairStrands;
 use crate::mesh::{
-    BundleDesc, CageCorner, HairMesh, LAYER_COUNT, STYLE_TEXELS, STYLE_U, STYLE_V, STYLE_W,
+    BundleDesc, CageCorner, HairMesh, LAYER_COUNT, STYLE_TEXELS, STYLE_U, STYLE_V,
 };
 
 const MIN_STRANDS_PER_BUNDLE: usize = 8;
@@ -679,6 +679,7 @@ fn deflate(cov: Mat3, axis: Vec3) -> Mat3 {
 mod tests {
     use super::*;
     use crate::hair_file::HairStrands;
+    use crate::mesh::STYLE_W;
 
     #[test]
     fn straight_cage_residuals_are_near_zero() {

@@ -90,8 +90,6 @@ pub struct HairPipelines {
     pub filter_layout: BindGroupLayoutDescriptor,
     pub composite_layout: BindGroupLayoutDescriptor,
     pub composite_shader: Handle<Shader>,
-    /// Keeps the shader assets alive after they are queued.
-    pub shaders: Vec<Handle<Shader>>,
 }
 
 pub fn init_pipelines(
@@ -199,7 +197,6 @@ pub fn init_pipelines(
         filter_layout,
         composite_layout,
         composite_shader: composite,
-        shaders: vec![clear, clear_dom, lod, scan, raster, shade, filter],
     };
     commands.insert_resource(pipelines);
 }

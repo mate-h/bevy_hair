@@ -7,8 +7,10 @@
 
 mod bake;
 mod env;
+#[cfg(test)]
 mod gbuffer;
 mod hair_file;
+#[cfg(test)]
 mod lod;
 mod mesh;
 mod obj;

@@ -30,11 +30,6 @@ pub fn control_point_count(l: f32, layer_count: u32) -> u32 {
     snapped.min(C_MAX) as u32
 }
 
-/// Full-resolution control-point count used when LOD is disabled.
-pub fn control_point_count_full() -> u32 {
-    127
-}
-
 /// Eq. 8. Unitless optical-depth shift; the shader scales it into light-view depth.
 pub fn depth_correction(beta: f32) -> f32 {
     let beta = beta.clamp(1e-4, 1.0);

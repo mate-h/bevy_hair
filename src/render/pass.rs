@@ -64,7 +64,6 @@ pub struct GpuGroom {
     pub layers: Buffer,
     pub style: Buffer,
     pub bundle_count: u32,
-    pub strand_count: u32,
     pub bounds_min: Vec3,
     pub bounds_max: Vec3,
     pub camera_lod: Buffer,
@@ -104,7 +103,6 @@ impl GpuGroom {
             layers: init_buffer(device, "hair_layers", &layers),
             style: init_buffer(device, "hair_style", &mesh.style),
             bundle_count,
-            strand_count,
             bounds_min: mesh.bounds_min,
             bounds_max: mesh.bounds_max,
             camera_lod: zeros(
