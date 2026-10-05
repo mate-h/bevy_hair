@@ -9,22 +9,43 @@
 //! includes this file and loads the same cache.
 
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 use std::time::Instant;
 
+use bevy::app::App;
+use bevy::log::{info, warn, LogPlugin};
 use bevy::math::Vec3;
 use bevy_hair::{
-    BAKE_FINGERPRINT, BundleDesc, CageCorner, HairMesh, bake_hair_mesh, load_hair_path,
+    BAKE_FINGERPRINT, BundleDesc, CageCorner, HairMesh, Scalp, bake_hair_mesh_with_scalp,
+    load_hair_path, load_obj_path,
 };
 
 pub const GROOM_FILES: [&str; 3] = ["wStraight.hair", "wWavy.hair", "wCurly.hair"];
+
+static LOGGING: Once = Once::new();
+
+pub fn ensure_logging() {
+    LOGGING.call_once(|| {
+        App::new().add_plugins(LogPlugin::default());
+    });
+}
 
 // Entry point for `cargo run --example bake`. The groom example includes this
 // file as a module and does not call it.
 #[allow(dead_code)]
 fn main() {
+    let scalp = scalp_from_asset();
     for file in GROOM_FILES {
-        load(&asset_path(file));
+        load(&asset_path(file), &scalp);
     }
+}
+
+pub fn scalp_from_asset() -> Scalp {
+    let path = asset_path("woman.obj");
+    let mesh = load_obj_path(&path).unwrap_or_else(|err| {
+        panic!("failed to read {}: {err}", path.display());
+    });
+    Scalp::from_mesh(&mesh)
 }
 
 pub fn asset_path(name: &str) -> PathBuf {
@@ -33,11 +54,12 @@ pub fn asset_path(name: &str) -> PathBuf {
         .join(name)
 }
 
-pub fn load(path: &Path) -> HairMesh {
-    eprintln!("loading {path:?}");
+pub fn load(path: &Path, scalp: &Scalp) -> HairMesh {
+    ensure_logging();
+    info!("loading {path:?}");
     if let Some(mesh) = read_cache(path) {
-        eprintln!(
-            "  cached {} bundles / {} strands",
+        info!(
+            "cached {} bundles / {} strands",
             mesh.bundles.len(),
             mesh.strand_count()
         );
@@ -48,20 +70,20 @@ pub fn load(path: &Path) -> HairMesh {
     let strands = load_hair_path(path).unwrap_or_else(|err| {
         panic!("failed to read {}: {err}", path.display());
     });
-    eprintln!(
-        "  {} strands, {} points",
+    info!(
+        "{} strands, {} points",
         strands.strands.len(),
         strands.points.len()
     );
-    let mesh = bake_hair_mesh(&strands);
-    eprintln!(
-        "  baked {} bundles / {} strands in {:.1}s",
+    let mesh = bake_hair_mesh_with_scalp(&strands, Some(scalp));
+    info!(
+        "baked {} bundles / {} strands in {:.1}s",
         mesh.bundles.len(),
         mesh.strand_count(),
         started.elapsed().as_secs_f32()
     );
     if let Err(err) = write_cache(path, &mesh) {
-        eprintln!("  cache write failed: {err}");
+        warn!("cache write failed: {err}");
     }
     mesh
 }
@@ -72,6 +94,9 @@ struct SourceStamp {
     len: u64,
     secs: u64,
     nanos: u32,
+    scalp_len: u64,
+    scalp_secs: u64,
+    scalp_nanos: u32,
 }
 
 fn cache_path(source: &Path) -> PathBuf {
@@ -82,14 +107,23 @@ fn cache_path(source: &Path) -> PathBuf {
         .with_extension("bake")
 }
 
-fn source_stamp(path: &Path) -> Option<SourceStamp> {
+fn file_stamp(path: &Path) -> Option<(u64, u64, u32)> {
     let meta = std::fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?;
     let elapsed = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some((meta.len(), elapsed.as_secs(), elapsed.subsec_nanos()))
+}
+
+fn source_stamp(path: &Path) -> Option<SourceStamp> {
+    let (len, secs, nanos) = file_stamp(path)?;
+    let (scalp_len, scalp_secs, scalp_nanos) = file_stamp(&asset_path("woman.obj"))?;
     Some(SourceStamp {
-        len: meta.len(),
-        secs: elapsed.as_secs(),
-        nanos: elapsed.subsec_nanos(),
+        len,
+        secs,
+        nanos,
+        scalp_len,
+        scalp_secs,
+        scalp_nanos,
     })
 }
 
@@ -125,6 +159,9 @@ fn encode(stamp: &SourceStamp, mesh: &HairMesh) -> Vec<u8> {
     push_u64(&mut out, stamp.len);
     push_u64(&mut out, stamp.secs);
     push_u32(&mut out, stamp.nanos);
+    push_u64(&mut out, stamp.scalp_len);
+    push_u64(&mut out, stamp.scalp_secs);
+    push_u32(&mut out, stamp.scalp_nanos);
     push_u32(&mut out, mesh.bundles.len() as u32);
     push_u32(&mut out, mesh.corners.len() as u32);
     push_u32(&mut out, mesh.style.len() as u32);
@@ -158,6 +195,9 @@ fn decode(bytes: &[u8], stamp: &SourceStamp) -> Option<HairMesh> {
         || cursor.u64()? != stamp.len
         || cursor.u64()? != stamp.secs
         || cursor.u32()? != stamp.nanos
+        || cursor.u64()? != stamp.scalp_len
+        || cursor.u64()? != stamp.scalp_secs
+        || cursor.u32()? != stamp.scalp_nanos
     {
         return None;
     }

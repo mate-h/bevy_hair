@@ -205,7 +205,9 @@ fn main(
     workgroupBarrier();
 
     let ncp = clamp(strand.control_points, 2u, 127u);
-    let s = max((ncp - 1u + 31u) / 32u, 1u);
+    // Points per lane. ceil((ncp - 1) / 32) covers segments only, and LOD
+    // counts are 2^k+1, so the tip stayed zero and the last segment hit the origin.
+    let s = max((ncp + 31u) / 32u, 1u);
     let first = lane * s;
     for (var k = 0u; k < 4u; k++) {
         if k >= s {

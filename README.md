@@ -24,7 +24,7 @@ cargo run --example groom
 | L | level of detail |
 | F | reconnection filter |
 | O | ambient occlusion |
-| D | deep opacity map |
+| M | deep opacity map |
 | `[` / `]` | lambda (default 3) |
 
 ## Hair models

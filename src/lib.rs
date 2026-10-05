@@ -18,7 +18,7 @@ mod render;
 
 use bevy::prelude::*;
 
-pub use bake::{BAKE_FINGERPRINT, bake_hair_mesh};
+pub use bake::{BAKE_FINGERPRINT, Scalp, bake_hair_mesh, bake_hair_mesh_with_scalp};
 pub use hair_file::{HairError, HairStrands, load_hair_path, parse_hair};
 pub use mesh::{BundleDesc, CageCorner, HairMesh, LAYER_COUNT};
 pub use obj::load_obj_path;

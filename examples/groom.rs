@@ -4,29 +4,30 @@
 //! cargo run --example groom
 //! ```
 //!
-//! Right-drag to look, WASD to move, Q/E to rise and fall, scroll to change
-//! speed. Keys: 1/2/3 switch grooms, L/F/O/D toggle LOD, the reconnection
-//! filter, ambient occlusion, and the deep opacity map, and `[` / `]` change
-//! lambda.
+//! Groom controls are logged after the free-camera help. `C` draws each baked bundle
+//! as a colored wireframe cage.
 //!
-//! Baked meshes are reused from `target/groom-cache/` until the hair file or
-//! the baker changes. `cargo run --example bake` fills that cache without
-//! opening a window.
+//! Baked meshes are reused from `target/groom-cache/` until the hair file, the
+//! scalp, or the baker changes. `cargo run --example bake` fills that cache
+//! without opening a window.
 
 mod bake;
 
 use std::f32::consts::FRAC_PI_2;
+use std::fmt;
 
+use bevy::app::{PluginGroup, RunFixedMainLoop, RunFixedMainLoopSystems};
+use bevy::log::LogPlugin;
 use bevy::camera::Hdr;
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
 use bevy::render::RenderPlugin;
 use bevy::render::render_resource::{TextureUsages, WgpuFeatures};
 use bevy::render::settings::WgpuSettings;
-use bevy_camera_controller::free_camera::{FreeCamera, FreeCameraPlugin};
-use bevy_hair::{HairGroom, HairMesh, HairPlugin, load_obj_path};
-
-const GROOM_NAMES: [&str; 3] = ["straight", "wavy", "curly"];
+use bevy_camera_controller::free_camera::{
+    run_freecamera_controller, FreeCamera, FreeCameraPlugin,
+};
+use bevy_hair::{HairGroom, HairMesh, HairPlugin, LAYER_COUNT, Scalp};
 
 fn main() {
     let mut wgpu = WgpuSettings::default();
@@ -49,15 +50,64 @@ fn main() {
                         ..default()
                     }),
                     ..default()
-                }),
+                })
+                .build()
+                .disable::<LogPlugin>(),
         )
         .add_plugins((HairPlugin, FreeCameraPlugin))
         .insert_resource(ClearColor(Color::srgb(0.04, 0.045, 0.05)))
         .insert_resource(prepared)
+        .insert_resource(ShowCage(false))
         .add_systems(Startup, setup)
-        .add_systems(Update, (controls, hud))
+        .add_systems(
+            RunFixedMainLoop,
+            print_groom_controls
+                .after(run_freecamera_controller)
+                .in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop),
+        )
+        .add_systems(Update, (controls, draw_cages))
         .run();
 }
+
+struct GroomControls;
+
+impl fmt::Display for GroomControls {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "
+bevy_hair Controls:
+    {:?} & {:?} & {:?}\t- Switch straight, wavy, and curly groom
+    {:?}\t- Toggle level of detail
+    {:?}\t- Toggle reconnection filter
+    {:?}\t- Toggle ambient occlusion
+    {:?}\t- Toggle deep opacity map
+    {:?} & {:?}\t- Decrease and increase lambda
+    {:?}\t- Toggle bundle cage wireframe",
+            KeyCode::Digit1,
+            KeyCode::Digit2,
+            KeyCode::Digit3,
+            KeyCode::KeyL,
+            KeyCode::KeyF,
+            KeyCode::KeyO,
+            KeyCode::KeyM,
+            KeyCode::BracketLeft,
+            KeyCode::BracketRight,
+            KeyCode::KeyC,
+        )
+    }
+}
+
+fn print_groom_controls(mut printed: Local<bool>, cameras: Query<(), With<Camera>>) {
+    if *printed || cameras.is_empty() {
+        return;
+    }
+    *printed = true;
+    info!("{}", GroomControls);
+}
+
+#[derive(Resource)]
+struct ShowCage(bool);
 
 #[derive(Resource)]
 struct Prepared {
@@ -72,11 +122,12 @@ struct GroomLibrary {
 }
 
 fn prepare_assets() -> Prepared {
-    let grooms = bake::GROOM_FILES.map(|file| bake::load(&bake::asset_path(file)));
     let head_path = bake::asset_path("woman.obj");
-    let head = load_obj_path(&head_path).unwrap_or_else(|err| {
+    let head = bevy_hair::load_obj_path(&head_path).unwrap_or_else(|err| {
         panic!("failed to read {}: {err}", head_path.display());
     });
+    let scalp = Scalp::from_mesh(&head);
+    let grooms = bake::GROOM_FILES.map(|file| bake::load(&bake::asset_path(file), &scalp));
     Prepared { grooms, head }
 }
 
@@ -136,6 +187,8 @@ fn setup(
             // The head is about 120 units tall.
             walk_speed: 40.0,
             run_speed: 120.0,
+            // `M` toggles the deep opacity map in `controls`.
+            keyboard_key_toggle_cursor_grab: KeyCode::KeyG,
             ..default()
         },
     ));
@@ -173,21 +226,6 @@ fn setup(
         },
         Transform::from_translation(rim),
     ));
-
-    commands.spawn((
-        Text::new("bevy_hair"),
-        TextFont {
-            font_size: FontSize::Px(16.0),
-            ..default()
-        },
-        TextColor(Color::srgb(0.92, 0.9, 0.86)),
-        Node {
-            position_type: PositionType::Absolute,
-            top: px(12),
-            left: px(12),
-            ..default()
-        },
-    ));
 }
 
 fn empty_groom() -> HairMesh {
@@ -204,6 +242,7 @@ fn controls(
     keys: Res<ButtonInput<KeyCode>>,
     mut grooms: Query<&mut HairGroom>,
     mut library: ResMut<GroomLibrary>,
+    mut cages: ResMut<ShowCage>,
 ) {
     let Ok(mut groom) = grooms.single_mut() else {
         return;
@@ -215,46 +254,99 @@ fn controls(
         if keys.just_pressed(key) {
             library.active = index;
             groom.mesh = library.handles[index].clone();
+            info!("groom: {}", bake::GROOM_FILES[index]);
         }
     }
     if keys.just_pressed(KeyCode::KeyL) {
         groom.lod = !groom.lod;
+        info!("level of detail: {}", on_off(groom.lod));
     }
     if keys.just_pressed(KeyCode::KeyF) {
         groom.filter = !groom.filter;
+        info!("reconnection filter: {}", on_off(groom.filter));
     }
     if keys.just_pressed(KeyCode::KeyO) {
         groom.ambient_occlusion = !groom.ambient_occlusion;
+        info!("ambient occlusion: {}", on_off(groom.ambient_occlusion));
     }
-    if keys.just_pressed(KeyCode::KeyD) {
+    if keys.just_pressed(KeyCode::KeyM) {
         groom.deep_opacity = !groom.deep_opacity;
+        info!("deep opacity map: {}", on_off(groom.deep_opacity));
     }
     if keys.just_pressed(KeyCode::BracketLeft) {
         groom.lambda = (groom.lambda - 0.5).max(0.5);
+        info!("lambda: {:.1}", groom.lambda);
     }
     if keys.just_pressed(KeyCode::BracketRight) {
         groom.lambda = (groom.lambda + 0.5).min(12.0);
+        info!("lambda: {:.1}", groom.lambda);
+    }
+    if keys.just_pressed(KeyCode::KeyC) {
+        cages.0 = !cages.0;
+        info!("cage wireframe: {}", on_off(cages.0));
     }
 }
 
-fn hud(grooms: Query<&HairGroom>, library: Res<GroomLibrary>, mut text: Query<&mut Text>) {
-    let Ok(groom) = grooms.single() else {
-        return;
-    };
-    let Ok(mut text) = text.single_mut() else {
-        return;
-    };
-    text.0 = format!(
-        "{}\nlambda {:.1}   LOD {}   filter {}   AO {}   DOM {}\n1/2/3 groom   L F O D toggles   [ ] lambda\nright-drag look   WASD move   QE up/down   scroll speed",
-        GROOM_NAMES[library.active],
-        groom.lambda,
-        on(groom.lod),
-        on(groom.filter),
-        on(groom.ambient_occlusion),
-        on(groom.deep_opacity),
-    );
+fn on_off(enabled: bool) -> &'static str {
+    if enabled {
+        "on"
+    } else {
+        "off"
+    }
 }
 
-fn on(value: bool) -> &'static str {
-    if value { "on" } else { "off" }
+fn draw_cages(
+    show: Res<ShowCage>,
+    grooms: Query<(&HairGroom, &GlobalTransform)>,
+    meshes: Res<Assets<HairMesh>>,
+    mut gizmos: Gizmos,
+) {
+    if !show.0 {
+        return;
+    }
+    for (groom, transform) in &grooms {
+        let Some(mesh) = meshes.get(&groom.mesh) else {
+            continue;
+        };
+        for bundle in 0..mesh.bundles.len() {
+            let color = bundle_color(bundle);
+            for layer in 0..LAYER_COUNT as usize {
+                let quad = mesh.layer_corners(bundle, layer);
+                let world = [
+                    transform.transform_point(quad[0]),
+                    transform.transform_point(quad[1]),
+                    transform.transform_point(quad[3]),
+                    transform.transform_point(quad[2]),
+                ];
+                gizmos.line(world[0], world[1], color);
+                gizmos.line(world[1], world[2], color);
+                gizmos.line(world[2], world[3], color);
+                gizmos.line(world[3], world[0], color);
+                if layer + 1 == LAYER_COUNT as usize {
+                    continue;
+                }
+                let next = mesh.layer_corners(bundle, layer + 1);
+                for corner in 0..4 {
+                    gizmos.line(
+                        transform.transform_point(quad[corner]),
+                        transform.transform_point(next[corner]),
+                        color,
+                    );
+                }
+            }
+            let mut prev =
+                transform.transform_point(mesh.styled_position(bundle, Vec2::splat(0.5), 0.0));
+            for step in 1..LAYER_COUNT {
+                let w = step as f32 / (LAYER_COUNT - 1) as f32;
+                let next =
+                    transform.transform_point(mesh.styled_position(bundle, Vec2::splat(0.5), w));
+                gizmos.line(prev, next, color);
+                prev = next;
+            }
+        }
+    }
+}
+
+fn bundle_color(index: usize) -> Color {
+    Color::hsl((index as f32 * 137.508) % 360.0, 0.72, 0.62)
 }
