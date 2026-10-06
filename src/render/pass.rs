@@ -705,28 +705,6 @@ fn light_fit(
     (eye, forward, proj * view, near, far)
 }
 
-#[cfg(test)]
-mod dom_layout {
-    use super::{DOM_LAYERS, DOM_SIZE};
-
-    #[test]
-    fn shader_constants_match_the_buffer_layout() {
-        let layers = format!("const DOM_LAYERS: u32 = {DOM_LAYERS}u;");
-        let size = format!("const DOM_SIZE: u32 = {DOM_SIZE}u;");
-        let common = include_str!("shaders/common.wgsl");
-        let clear = include_str!("shaders/clear_dom.wgsl");
-        assert!(
-            common.contains(&layers),
-            "{layers} missing from common.wgsl"
-        );
-        assert!(
-            clear.contains(&layers),
-            "{layers} missing from clear_dom.wgsl"
-        );
-        assert!(clear.contains(&size), "{size} missing from clear_dom.wgsl");
-    }
-}
-
 fn depth_is_reverse(clip: Mat4, camera: Vec3, forward: Vec3) -> bool {
     let near = clip_z(clip, camera + forward * 0.5);
     let far = clip_z(clip, camera + forward * 30.0);
@@ -1009,4 +987,26 @@ fn dispatch_raster(
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, &group, &[]);
     pass.dispatch_workgroups_indirect(indirect, 0);
+}
+
+#[cfg(test)]
+mod dom_layout {
+    use super::{DOM_LAYERS, DOM_SIZE};
+
+    #[test]
+    fn shader_constants_match_the_buffer_layout() {
+        let layers = format!("const DOM_LAYERS: u32 = {DOM_LAYERS}u;");
+        let size = format!("const DOM_SIZE: u32 = {DOM_SIZE}u;");
+        let common = include_str!("shaders/common.wgsl");
+        let clear = include_str!("shaders/clear_dom.wgsl");
+        assert!(
+            common.contains(&layers),
+            "{layers} missing from common.wgsl"
+        );
+        assert!(
+            clear.contains(&layers),
+            "{layers} missing from clear_dom.wgsl"
+        );
+        assert!(clear.contains(&size), "{size} missing from clear_dom.wgsl");
+    }
 }
