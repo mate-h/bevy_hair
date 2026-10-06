@@ -88,25 +88,14 @@ fn write_pixel(pixel: vec2<i32>, t: f32, p0: vec3<f32>, p1: vec3<f32>, t0: vec3<
     if dist <= params.screen.z {
         return;
     }
-    if params.pass_mode.x == 0u {
-        let clip = params.clip_from_world * vec4<f32>(world, 1.0);
-        let clip_depth = clip.z / max(clip.w, 1e-5);
-        let scene = textureLoad(scene_depth, pixel, 0);
-        if params.pass_mode.z == 1u {
-            if clip_depth < scene {
-                return;
-            }
-        } else if clip_depth > scene {
+    let clip = params.clip_from_world * vec4<f32>(world, 1.0);
+    let clip_depth = clip.z / max(clip.w, 1e-5);
+    let scene = textureLoad(scene_depth, pixel, 0);
+    if params.pass_mode.z == 1u {
+        if clip_depth < scene {
             return;
         }
-    }
-
-    if params.pass_mode.x == 1u {
-        let dom_w = u32(params.dom_info.x);
-        let z = clamp((dist - params.screen.z) / max(params.screen.w - params.screen.z, 1e-3), 0.0, 0.999);
-        let slice = min(u32(z * 4.0), 3u);
-        let pix = u32(pixel.y) * dom_w + u32(pixel.x);
-        atomicAdd(&dom[pix * 4u + slice], 1u);
+    } else if clip_depth > scene {
         return;
     }
 
@@ -123,6 +112,80 @@ fn write_pixel(pixel: vec2<i32>, t: f32, p0: vec3<f32>, p1: vec3<f32>, t0: vec3<
         atomicMin(&center[pix], payload);
         let beta_q = u32(clamp(beta, 0.0, 1.0) * 255.0 + 0.5);
         atomicMin(&beta_buf[pix], (depth << 8u) | beta_q);
+    }
+}
+
+fn write_dom_pixel(pixel: vec2<i32>, world: vec3<f32>) {
+    let width = i32(params.screen.x);
+    let height = i32(params.screen.y);
+    if pixel.x < 0 || pixel.y < 0 || pixel.x >= width || pixel.y >= height {
+        return;
+    }
+    let near = params.screen.z;
+    let far = params.screen.w;
+    let dist = dot(world - params.camera_pos.xyz, params.camera_forward.xyz);
+    if dist <= near || dist >= far {
+        return;
+    }
+    let dom_w = u32(params.dom_info.x);
+    let pix = u32(pixel.y) * dom_w + u32(pixel.x);
+    let q = quantize_depth(dist, near, far);
+    // Pass 1 stores the nearest depth. Pass 2 bins opacity behind that depth.
+    if params.pass_mode.x == 1u {
+        atomicMin(&dom[pix], q);
+        return;
+    }
+    let front_q = atomicLoad(&dom[pix]);
+    if front_q == DOM_EMPTY {
+        return;
+    }
+    let z_front = dequantize_depth(front_q, near, far);
+    let thickness = max(far - near, 1e-3) / f32(DOM_LAYERS);
+    let t = max(dist - z_front, 0.0) / thickness;
+    let slice = min(u32(t), DOM_LAYERS - 1u);
+    let pixels = dom_w * u32(params.dom_info.y);
+    atomicAdd(&dom[pixels + pix * DOM_LAYERS + slice], 1u);
+}
+
+fn draw_dom_segment(p0: vec3<f32>, p1: vec3<f32>, include_start: bool) {
+    let a = project_world(params, p0);
+    let b = project_world(params, p1);
+    if !a.in_front && !b.in_front {
+        return;
+    }
+    var x0 = i32(floor(a.screen.x));
+    var y0 = i32(floor(a.screen.y));
+    let x1 = i32(floor(b.screen.x));
+    let y1 = i32(floor(b.screen.y));
+    let dx = abs(x1 - x0);
+    let dy = abs(y1 - y0);
+    let sx = select(-1, 1, x0 < x1);
+    let sy = select(-1, 1, y0 < y1);
+    var err = dx - dy;
+    let seg = b.screen - a.screen;
+    let seg_len2 = max(dot(seg, seg), 1e-6);
+    // The next segment owns a shared screen-space endpoint. A segment that
+    // stays in one pixel is moving along the light and has to bin its own depth.
+    var skip = !include_start && (x0 != x1 || y0 != y1);
+    for (var step = 0; step < 1024; step++) {
+        if !skip {
+            let center = vec2<f32>(f32(x0), f32(y0)) + 0.5;
+            let t = clamp(dot(center - a.screen, seg) / seg_len2, 0.0, 1.0);
+            write_dom_pixel(vec2<i32>(x0, y0), mix(p0, p1, t));
+        }
+        skip = false;
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = err + err;
+        if e2 > -dy {
+            err -= dy;
+            x0 += sx;
+        }
+        if e2 < dx {
+            err += dx;
+            y0 += sy;
+        }
     }
 }
 
@@ -262,9 +325,13 @@ fn main(
         if idx + 1u < ncp {
             let p0 = to_world(params, cp_pos[idx].xyz);
             let p1 = to_world(params, cp_pos[idx + 1u].xyz);
-            let t0 = dir_world(params, cp_tan[idx].xyz);
-            let t1 = dir_world(params, cp_tan[idx + 1u].xyz);
-            draw_segment(p0, p1, t0, t1, cp_uvw[idx].xyz, cp_uvw[idx + 1u].xyz, cp_uvw[idx].w, cp_uvw[idx + 1u].w, beta);
+            if params.pass_mode.x != 0u {
+                draw_dom_segment(p0, p1, idx == 0u);
+            } else {
+                let t0 = dir_world(params, cp_tan[idx].xyz);
+                let t1 = dir_world(params, cp_tan[idx + 1u].xyz);
+                draw_segment(p0, p1, t0, t1, cp_uvw[idx].xyz, cp_uvw[idx + 1u].xyz, cp_uvw[idx].w, cp_uvw[idx + 1u].w, beta);
+            }
         }
     }
 }

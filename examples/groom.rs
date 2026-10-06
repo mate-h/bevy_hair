@@ -18,7 +18,7 @@ use std::fmt;
 
 use bevy::app::{PluginGroup, RunFixedMainLoop, RunFixedMainLoopSystems};
 use bevy::camera::Hdr;
-use bevy::light::Skybox;
+use bevy::light::CascadeShadowConfigBuilder;
 use bevy::log::LogPlugin;
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
@@ -66,7 +66,7 @@ fn main() {
                 .after(run_freecamera_controller)
                 .in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop),
         )
-        .add_systems(Update, (controls, draw_cages))
+        .add_systems(Update, (controls, draw_cages, spin_environment))
         .run();
 }
 
@@ -84,7 +84,8 @@ bevy_hair Controls:
     {:?}\t- Toggle ambient occlusion
     {:?}\t- Toggle deep opacity map
     {:?} & {:?}\t- Decrease and increase lambda
-    {:?}\t- Toggle bundle cage wireframe",
+    {:?}\t- Toggle bundle cage wireframe
+    {:?}\t- Spin the environment and key light",
             KeyCode::Digit1,
             KeyCode::Digit2,
             KeyCode::Digit3,
@@ -95,6 +96,7 @@ bevy_hair Controls:
             KeyCode::BracketLeft,
             KeyCode::BracketRight,
             KeyCode::KeyC,
+            KeyCode::Space,
         )
     }
 }
@@ -109,6 +111,14 @@ fn print_groom_controls(mut printed: Local<bool>, cameras: Query<(), With<Camera
 
 #[derive(Resource)]
 struct ShowCage(bool);
+
+#[derive(Resource)]
+struct EnvTurntable {
+    spinning: bool,
+    angle: f32,
+    focus: Vec3,
+    sun_dir: Vec3,
+}
 
 #[derive(Resource)]
 struct Prepared {
@@ -163,9 +173,6 @@ fn setup(
             perceptual_roughness: 0.45,
             metallic: 0.0,
             specular_tint: Color::srgb(1.0, 0.74, 0.62),
-            diffuse_transmission: 0.18,
-            attenuation_color: Color::srgb(0.9, 0.22, 0.12),
-            attenuation_distance: 6.0,
             ..default()
         })),
         model,
@@ -183,11 +190,21 @@ fn setup(
     ));
     commands.insert_resource(GroomLibrary { handles, active: 0 });
 
-    // One value for the face IBL, the skybox, and the hair probe lookup.
-    const ENV_INTENSITY: f32 = 200.0;
+    // One scale for the face IBL and the hair probe lookup.
+    // The bake stores EXR radiance. Reinhard with white point 1 crushes the
+    // sun in the IBL (specular mip 0 peaks at 1).
+    // `ENV_INTENSITY` is cd/m² per EXR unit. The solar disk integrates to
+    // 10.7 lux per EXR unit on a facing surface, measured on
+    // little_paris_eiffel_tower_2k.exr.
+    const ENV_INTENSITY: f32 = 2_000.0;
+    const SUN_ILLUMINANCE_PER_EXR: f32 = 10.7;
+    const KEY_LIGHT_INTENSITY: f32 = ENV_INTENSITY * SUN_ILLUMINANCE_PER_EXR;
+    // Environment sun, 12° up. Startup yaw matches `EnvTurntable::angle`.
+    let sun_dir = Vec3::new(0.788, 0.217, 0.576).normalize();
+    let env_angle = FRAC_PI_2;
+    let env_yaw = Quat::from_rotation_y(env_angle);
     let diffuse = asset_server.load("env/little_paris_eiffel_tower_2k_diffuse.ktx2");
     let specular = asset_server.load("env/little_paris_eiffel_tower_2k_specular.ktx2");
-    let skybox = asset_server.load("env/little_paris_eiffel_tower_2k_skybox.ktx2");
     commands.spawn((
         Camera3d {
             depth_texture_usages: (TextureUsages::RENDER_ATTACHMENT
@@ -195,21 +212,30 @@ fn setup(
                 .into(),
             ..default()
         },
+        // 50mm on a 36×24mm sensor. Bevy stores the vertical angle.
+        Projection::Perspective(PerspectiveProjection {
+            fov: 2.0 * (24.0_f32 / (2.0 * 50.0)).atan(),
+            ..default()
+        }),
         Hdr,
         Msaa::Off,
         EnvironmentMapLight {
             diffuse_map: diffuse,
             specular_map: specular,
             intensity: ENV_INTENSITY,
+            rotation: env_yaw,
             ..default()
         },
-        Skybox {
-            image: Some(skybox),
-            brightness: ENV_INTENSITY,
-            ..default()
+        // Same heading as (150, 0, 40), 15° above the face, far enough for the 50mm frame.
+        {
+            let heading = Vec3::new(150.0, 0.0, 40.0).normalize();
+            let pitch = 15.0_f32.to_radians();
+            let distance = 431.0;
+            let eye = focus
+                + heading * (distance * pitch.cos())
+                + Vec3::Y * (distance * pitch.sin());
+            Transform::from_translation(eye).looking_at(focus, Vec3::Y)
         },
-        Transform::from_xyz(focus.x + 150.0, focus.y + 18.0, focus.z + 40.0)
-            .looking_at(focus, Vec3::Y),
         FreeCamera {
             // The head is about 120 units tall.
             walk_speed: 40.0,
@@ -220,16 +246,30 @@ fn setup(
         },
     ));
 
-    // The bake's white point removes the sun. This key replaces it.
-    // Exposure stays at Bevy's default, EV 9.7.
-    let key = focus + Vec3::new(70.0, 90.0, 50.0);
+    // Replaces the disk the bake removed. Color is the disk's energy-weighted
+    // RGB divided by its luminance, so `illuminance` stays in lux.
+    // Exposure stays at EV 9.7. `spin_environment` continues from this yaw.
+    let key = focus + (env_yaw * sun_dir) * 120.0;
+    commands.insert_resource(EnvTurntable {
+        spinning: false,
+        angle: env_angle,
+        focus,
+        sun_dir,
+    });
     commands.spawn((
         DirectionalLight {
-            color: Color::srgb(1.0, 0.95, 0.86),
-            illuminance: 60_000.0,
+            color: Color::linear_rgb(1.282, 0.964, 0.526),
+            illuminance: KEY_LIGHT_INTENSITY,
             shadow_maps_enabled: true,
             ..default()
         },
+        // Default `maximum_distance` is 150; the opening camera is already farther than that.
+        CascadeShadowConfigBuilder {
+            first_cascade_far_bound: 50.0,
+            maximum_distance: 800.0,
+            ..default()
+        }
+        .build(),
         Transform::from_translation(key).looking_at(focus, Vec3::Y),
     ));
 }
@@ -290,6 +330,33 @@ fn controls(
     if keys.just_pressed(KeyCode::KeyC) {
         cages.0 = !cages.0;
         info!("cage wireframe: {}", on_off(cages.0));
+    }
+}
+
+fn spin_environment(
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut turntable: ResMut<EnvTurntable>,
+    mut lights: Query<&mut Transform, With<DirectionalLight>>,
+    mut environment: Query<&mut EnvironmentMapLight>,
+) {
+    if keys.just_pressed(KeyCode::Space) {
+        turntable.spinning = !turntable.spinning;
+        info!("environment rotation: {}", on_off(turntable.spinning));
+    }
+    if turntable.spinning {
+        // One revolution takes about 24 seconds.
+        turntable.angle = (turntable.angle + time.delta_secs() * std::f32::consts::TAU / 24.0)
+            .rem_euclid(std::f32::consts::TAU);
+    }
+    let yaw = Quat::from_rotation_y(turntable.angle);
+    if let Ok(mut light) = environment.single_mut() {
+        light.rotation = yaw;
+    }
+    if let Ok(mut transform) = lights.single_mut() {
+        let dir = yaw * turntable.sun_dir;
+        *transform = Transform::from_translation(turntable.focus + dir * 120.0)
+            .looking_at(turntable.focus, Vec3::Y);
     }
 }
 

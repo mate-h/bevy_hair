@@ -30,10 +30,31 @@ pub fn control_point_count(l: f32, layer_count: u32) -> u32 {
     snapped.min(C_MAX) as u32
 }
 
-/// Eq. 8. Unitless optical-depth shift; the shader scales it into light-view depth.
+/// Eq. 8. Unitless optical-depth shift toward the light. The shader multiplies this
+/// by one hair-mesh layer of light-view depth and subtracts it before the deep
+/// opacity lookup, so a thinned groom does not sample the shell that was removed.
 pub fn depth_correction(beta: f32) -> f32 {
     let beta = beta.clamp(1e-4, 1.0);
     -beta.ln()
+}
+
+/// Hits in front of a shaded point, from Yuksel and Keyser 2008.
+///
+/// `t` is the depth past the texel’s front surface, in layers. Completed layers
+/// count fully. The layer that contains the point counts only the fraction in
+/// front of it. Hair at the same depth or behind the point does not count.
+/// `dom_optical_depth` in `shade.wgsl` follows this.
+pub fn dom_optical_depth(layers: &[u32], t: f32) -> f32 {
+    let mut occ = 0.0;
+    for (slice, count) in layers.iter().copied().enumerate() {
+        let i = slice as f32;
+        if i + 1.0 <= t {
+            occ += count as f32;
+        } else if i < t {
+            occ += count as f32 * (t - i);
+        }
+    }
+    occ
 }
 
 /// Screen AABB is completely outside the viewport.
@@ -97,5 +118,18 @@ mod tests {
         assert!(depth_correction(1.0).abs() < 1e-4);
         assert!(depth_correction(0.5) > depth_correction(1.0));
         assert!(depth_correction(0.1) > depth_correction(0.5));
+    }
+
+    #[test]
+    fn deep_opacity_ignores_hair_at_or_behind_the_sample() {
+        let layers = [100, 40, 7];
+        assert_eq!(dom_optical_depth(&layers, 0.0), 0.0);
+        assert_eq!(dom_optical_depth(&layers, -1.0), 0.0);
+        // Halfway through the front layer: half of that layer, nothing behind it.
+        assert!((dom_optical_depth(&layers, 0.5) - 50.0).abs() < 1e-4);
+        // The boundary includes the layer just completed and excludes the next one.
+        assert!((dom_optical_depth(&layers, 1.0) - 100.0).abs() < 1e-4);
+        assert!((dom_optical_depth(&layers, 1.25) - 110.0).abs() < 1e-4);
+        assert!((dom_optical_depth(&layers, 3.0) - 147.0).abs() < 1e-4);
     }
 }

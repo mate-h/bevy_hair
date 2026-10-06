@@ -3,6 +3,9 @@ const STYLE_U: u32 = 8u;
 const STYLE_V: u32 = 8u;
 const STYLE_W: u32 = 16u;
 const PI: f32 = 3.14159265;
+// Opacity slices hung off the per-texel front depth. Keep in sync with `DOM_LAYERS`.
+const DOM_LAYERS: u32 = 16u;
+const DOM_EMPTY: u32 = 0xffffffffu;
 
 struct HairParams {
     clip_from_world: mat4x4<f32>,
@@ -16,6 +19,7 @@ struct HairParams {
     filter_params: vec4<f32>,
     albedo: vec4<f32>,
     flags: vec4<u32>,
+    // x: 0 camera raster, 1 opacity-map depth, 2 opacity-map layers.
     pass_mode: vec4<u32>,
     // Deep opacity map light view. Not a copy of the clustered light list.
     light_eye: vec4<f32>,

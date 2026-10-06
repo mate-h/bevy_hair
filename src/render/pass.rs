@@ -17,6 +17,10 @@ use crate::render::pipeline::{
 use crate::render::{ExtractedDirectional, ExtractedFrame, flag};
 
 pub const DOM_SIZE: u32 = 512;
+/// Opacity slices per light-space texel. Keep in sync with `DOM_LAYERS` in the shaders.
+pub const DOM_LAYERS: u32 = 16;
+/// Beer-Lambert extinction per strand fragment. Visibility is `exp(-hits * DOM_SIGMA)`.
+const DOM_SIGMA: f32 = 0.05;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -71,6 +75,7 @@ pub struct GpuGroom {
     pub dom_indirect: Buffer,
     pub camera_params: Buffer,
     pub dom_params: Buffer,
+    pub dom_opacity_params: Buffer,
 }
 
 impl GpuGroom {
@@ -132,6 +137,12 @@ impl GpuGroom {
             dom_params: zeros(
                 device,
                 "hair_dom_params",
+                HAIR_PARAMS_SIZE,
+                BufferKind::Uniform,
+            ),
+            dom_opacity_params: zeros(
+                device,
+                "hair_dom_opacity_params",
                 HAIR_PARAMS_SIZE,
                 BufferKind::Uniform,
             ),
@@ -352,6 +363,7 @@ pub fn hair_pass(
         // only has to contain the groom. A tight near plane drops the front strands.
         let cam_near = 0.05;
         let cam_far = (dist + radius * 4.0).max(cam_near + 1.0);
+        // Eq. 8 is one hair-mesh layer of light-view depth per e-fold of strand removal.
         let dom_scale = (light_far - light_near) / LAYER_COUNT as f32;
 
         let camera_params = make_params(ViewArgs {
@@ -386,8 +398,15 @@ pub fn hair_pass(
             pass_mode: [1, gpu.bundle_count, u32::from(reverse), 1],
             light_eye,
         });
+        let mut dom_opacity_params = dom_params;
+        dom_opacity_params.pass_mode[0] = 2;
         queue.write_buffer(&gpu.camera_params, 0, bytemuck::bytes_of(&camera_params));
         queue.write_buffer(&gpu.dom_params, 0, bytemuck::bytes_of(&dom_params));
+        queue.write_buffer(
+            &gpu.dom_opacity_params,
+            0,
+            bytemuck::bytes_of(&dom_opacity_params),
+        );
 
         let groups = (gpu.bundle_count.div_ceil(64), 1, 1);
         dispatch(
@@ -432,7 +451,9 @@ pub fn hair_pass(
         );
 
         if groom.deep_opacity {
-            let dom_pixels = DOM_SIZE * DOM_SIZE * 4;
+            // Depth texels, then DOM_LAYERS opacity counts. Two rasters: the
+            // second bins fragments relative to the nearest depth from the first.
+            let dom_words = DOM_SIZE * DOM_SIZE * (1 + DOM_LAYERS);
             {
                 let group = ctx.render_device().create_bind_group(
                     None,
@@ -447,7 +468,7 @@ pub fn hair_pass(
                     });
                 pass.set_pipeline(clear_dom);
                 pass.set_bind_group(0, &group, &[]);
-                pass.dispatch_workgroups(dom_pixels.div_ceil(256), 1, 1);
+                pass.dispatch_workgroups(dom_words.div_ceil(256), 1, 1);
             }
             dispatch(
                 &mut ctx,
@@ -483,6 +504,20 @@ pub fn hair_pass(
                 RasterBuffers {
                     gpu,
                     params: &gpu.dom_params,
+                    refs: &gpu.dom_refs,
+                    targets,
+                    depth_view,
+                    indirect: &gpu.dom_indirect,
+                },
+            );
+            dispatch_raster(
+                &mut ctx,
+                &cache,
+                raster,
+                &pipelines.raster_layout,
+                RasterBuffers {
+                    gpu,
+                    params: &gpu.dom_opacity_params,
                     refs: &gpu.dom_refs,
                     targets,
                     depth_view,
@@ -586,7 +621,7 @@ fn make_params(args: ViewArgs) -> HairParams {
             args.groom.lambda,
             args.groom.center_diameter,
         ],
-        filter_params: [1.0, 0.2, args.dom_scale.max(1e-3), 0.2],
+        filter_params: [1.0, 0.2, args.dom_scale.max(1e-3), DOM_SIGMA],
         albedo: args.groom.albedo.to_array(),
         flags: [
             flag(args.groom.lod),
@@ -670,6 +705,28 @@ fn light_fit(
     (eye, forward, proj * view, near, far)
 }
 
+#[cfg(test)]
+mod dom_layout {
+    use super::{DOM_LAYERS, DOM_SIZE};
+
+    #[test]
+    fn shader_constants_match_the_buffer_layout() {
+        let layers = format!("const DOM_LAYERS: u32 = {DOM_LAYERS}u;");
+        let size = format!("const DOM_SIZE: u32 = {DOM_SIZE}u;");
+        let common = include_str!("shaders/common.wgsl");
+        let clear = include_str!("shaders/clear_dom.wgsl");
+        assert!(
+            common.contains(&layers),
+            "{layers} missing from common.wgsl"
+        );
+        assert!(
+            clear.contains(&layers),
+            "{layers} missing from clear_dom.wgsl"
+        );
+        assert!(clear.contains(&size), "{size} missing from clear_dom.wgsl");
+    }
+}
+
 fn depth_is_reverse(clip: Mat4, camera: Vec3, forward: Vec3) -> bool {
     let near = clip_z(clip, camera + forward * 0.5);
     let far = clip_z(clip, camera + forward * 30.0);
@@ -703,7 +760,7 @@ fn ensure_targets(device: &RenderDevice, frame: &mut FrameGpu, width: u32, heigh
         dom: zeros(
             device,
             "hair_dom",
-            DOM_SIZE as u64 * DOM_SIZE as u64 * 4 * 4,
+            DOM_SIZE as u64 * DOM_SIZE as u64 * (1 + DOM_LAYERS as u64) * 4,
             BufferKind::Storage,
         ),
     });

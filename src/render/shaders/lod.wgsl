@@ -36,10 +36,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     var n_lod: u32 = 0u;
     var cps: u32 = LAYER_COUNT;
     if !culled {
-        // pass_mode.w == 1: deep opacity map. Full strand count, layer-resolution polylines.
+        // Deep opacity map: the full strand set at full polyline resolution.
+        // The camera's thinned groom is compensated at lookup time (Eq. 8).
         if params.pass_mode.w == 1u {
             n_lod = bundle.strand_count;
-            cps = LAYER_COUNT;
+            cps = control_points_for_lod(1.0);
         } else if params.flags.x == 0u {
             n_lod = bundle.strand_count;
             cps = 127u;

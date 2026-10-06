@@ -71,6 +71,39 @@ fn hair_bsdf(tangent: vec3<f32>, view: vec3<f32>, light: vec3<f32>, albedo: vec3
     return spec * cos_i + diffuse * 0.35;
 }
 
+fn dom_optical_depth(pix: u32, t: f32) -> f32 {
+    let pixels = u32(params.dom_info.x) * u32(params.dom_info.y);
+    let base = pixels + pix * DOM_LAYERS;
+    var occ = 0.0;
+    for (var slice = 0u; slice < DOM_LAYERS; slice++) {
+        let count = f32(dom[base + slice]);
+        let i = f32(slice);
+        if i + 1.0 <= t {
+            occ += count;
+        } else if i < t {
+            occ += count * (t - i);
+        }
+    }
+    return occ;
+}
+
+fn dom_texel_visibility(x: i32, y: i32, dist: f32, near: f32, far: f32, dom_w: u32, dom_h: u32) -> f32 {
+    if x < 0 || y < 0 || x >= i32(dom_w) || y >= i32(dom_h) {
+        return 1.0;
+    }
+    let pix = u32(y) * dom_w + u32(x);
+    let front_q = dom[pix];
+    if front_q == DOM_EMPTY {
+        return 1.0;
+    }
+    let z_front = dequantize_depth(front_q, near, far);
+    let thickness = max(far - near, 1e-3) / f32(DOM_LAYERS);
+    // A small slack keeps the front surface from reading the opacity it just
+    // wrote when reconstruction sits a fraction of a layer behind the map.
+    let rel = max(dist - z_front - thickness * 0.05, 0.0);
+    return exp(-dom_optical_depth(pix, rel / thickness) * params.filter_params.w);
+}
+
 fn dom_visibility(world: vec3<f32>, beta: f32) -> f32 {
     if params.flags.w == 0u {
         return 1.0;
@@ -86,26 +119,22 @@ fn dom_visibility(world: vec3<f32>, beta: f32) -> f32 {
     }
     let dom_w = u32(params.dom_info.x);
     let dom_h = u32(params.dom_info.y);
-    let coord = vec2<u32>(
-        min(u32(uv.x * f32(dom_w)), dom_w - 1u),
-        min(u32(uv.y * f32(dom_h)), dom_h - 1u),
-    );
     let near = params.dom_info.z;
     let far = params.dom_info.w;
-    let dist = dot(world - params.light_eye.xyz, params.light_forward.xyz);
-    let z = clamp((dist - near) / max(far - near, 1e-3), 0.0, 1.0);
-    // Eq. 8, scaled into the light-view depth range.
-    let delta = -log(max(beta, 1e-4)) * params.filter_params.z;
-    let z_biased = clamp(z - delta / max(far - near, 1e-3), 0.0, 1.0);
-    var occ = 0.0;
-    let base = (coord.y * dom_w + coord.x) * 4u;
-    for (var slice = 0u; slice < 4u; slice++) {
-        let slice_z = (f32(slice) + 0.5) / 4.0;
-        if slice_z < z_biased {
-            occ += f32(dom[base + slice]);
-        }
-    }
-    return exp(-occ * params.filter_params.w);
+    // Eq. 8. `-log(β)` hair-mesh layers toward the light.
+    let dist = dot(world - params.light_eye.xyz, params.light_forward.xyz)
+        - (-log(max(beta, 1e-4)) * params.filter_params.z);
+    let fx = uv.x * f32(dom_w) - 0.5;
+    let fy = uv.y * f32(dom_h) - 0.5;
+    let x0 = i32(floor(fx));
+    let y0 = i32(floor(fy));
+    let tx = fract(fx);
+    let ty = fract(fy);
+    let v00 = dom_texel_visibility(x0, y0, dist, near, far, dom_w, dom_h);
+    let v10 = dom_texel_visibility(x0 + 1, y0, dist, near, far, dom_w, dom_h);
+    let v01 = dom_texel_visibility(x0, y0 + 1, dist, near, far, dom_w, dom_h);
+    let v11 = dom_texel_visibility(x0 + 1, y0 + 1, dist, near, far, dom_w, dom_h);
+    return mix(mix(v00, v10, tx), mix(v01, v11, tx), ty);
 }
 
 fn spot_mask(light_id: u32, world: vec3<f32>) -> f32 {
