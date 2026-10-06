@@ -1,5 +1,7 @@
 # bevy_hair
 
+![groom example](assets/groom.webp)
+
 Real-time strand hair with deferred software rasterization on hair meshes.
 
 The renderer is a Bevy 0.19 plugin. It bakes explicit strands into layered hair-mesh bundles, generates strands in a subgroup compute shader, and rasterizes them into a 64-bit atomic G-buffer. Shading evaluates Chiang's R, TT, and TRT lobes plus a Kajiya–Kay diffuse term for every clustered light, with Bevy shadow maps and a 16-layer deep opacity map on the key directional. The camera environment map supplies one prefiltered specular lookup and an irradiance lookup. A reconnection filter reconstructs coverage.
