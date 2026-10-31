@@ -2,11 +2,12 @@ use std::collections::HashMap;
 
 use bevy::asset::AssetId;
 use bevy::ecs::system::SystemParam;
+use bevy::light::MAX_CUSTOM_SHADOW_CHANNELS;
 use bevy::math::{Mat4, Vec3, Vec4};
 use bevy::pbr::{MeshPipelineViewLayoutKey, MeshViewBindGroup, ViewKeyCache};
 use bevy::prelude::*;
-use bevy::render::render_resource::*;
 use bevy::render::render_asset::RenderAssets;
+use bevy::render::render_resource::*;
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery};
 use bevy::render::storage::GpuShaderBuffer;
 use bevy::render::view::{ViewDepthStencilTexture, ViewTarget};
@@ -16,7 +17,7 @@ use crate::mesh::{HairMesh, LAYER_COUNT};
 use crate::render::pipeline::{
     HAIR_PARAMS_SIZE, HairPipelines, HairShadePipeline, queue_composite,
 };
-use crate::render::{ExtractedDirectional, ExtractedFrame, flag};
+use crate::render::{ExtractedDirectional, ExtractedFrame, ExtractedGroom, flag};
 use crate::shadow::HairShadow;
 
 pub const DOM_SIZE: u32 = 512;
@@ -28,7 +29,12 @@ const DOM_SIGMA: f32 = 0.05;
 pub const DOM_BYTES: u64 = (DOM_SIZE * DOM_SIZE * (1 + DOM_LAYERS)) as u64 * 4;
 pub const SHADOW_LIGHT_BYTES: u64 = size_of::<ShadowLight>() as u64;
 
-/// The deep opacity map's light view for `hair_shadow.wesl`.
+pub const SHADOW_CHANNELS: usize = MAX_CUSTOM_SHADOW_CHANNELS as usize;
+/// One deep opacity map per custom shadow channel, plus the key light's when
+/// it has no channel.
+const DOM_VIEWS: usize = SHADOW_CHANNELS + 1;
+
+/// A deep opacity map's light view for `hair_shadow.wesl`, one per channel.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct ShadowLight {
@@ -91,8 +97,16 @@ pub struct GpuGroom {
     pub dom_refs: Buffer,
     pub dom_indirect: Buffer,
     pub camera_params: Buffer,
-    pub dom_params: Buffer,
-    pub dom_opacity_params: Buffer,
+    /// Per light view, since every map's parameters are written before the
+    /// frame's commands run.
+    pub dom_params: Vec<DomParams>,
+}
+
+pub struct DomParams {
+    /// Pass 1: nearest strand depth.
+    pub depth: Buffer,
+    /// Pass 2: opacity slices behind it.
+    pub opacity: Buffer,
 }
 
 impl GpuGroom {
@@ -151,18 +165,22 @@ impl GpuGroom {
             ),
             dom_indirect: zeros(device, "hair_dom_indirect", 16, BufferKind::Indirect),
             camera_params: zeros(device, "hair_params", HAIR_PARAMS_SIZE, BufferKind::Uniform),
-            dom_params: zeros(
-                device,
-                "hair_dom_params",
-                HAIR_PARAMS_SIZE,
-                BufferKind::Uniform,
-            ),
-            dom_opacity_params: zeros(
-                device,
-                "hair_dom_opacity_params",
-                HAIR_PARAMS_SIZE,
-                BufferKind::Uniform,
-            ),
+            dom_params: (0..DOM_VIEWS)
+                .map(|_| DomParams {
+                    depth: zeros(
+                        device,
+                        "hair_dom_params",
+                        HAIR_PARAMS_SIZE,
+                        BufferKind::Uniform,
+                    ),
+                    opacity: zeros(
+                        device,
+                        "hair_dom_opacity_params",
+                        HAIR_PARAMS_SIZE,
+                        BufferKind::Uniform,
+                    ),
+                })
+                .collect(),
         }
     }
 }
@@ -329,13 +347,14 @@ pub fn hair_pass(
         .get_or_insert_with(|| {
             device.create_buffer(&BufferDescriptor {
                 label: Some("hair_shadow_light"),
-                size: SHADOW_LIGHT_BYTES,
+                size: SHADOW_LIGHT_BYTES * SHADOW_CHANNELS as u64,
                 usage: BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             })
         })
         .clone();
-    let mut shadow_light = ShadowLight::zeroed();
+    let mut shadow_lights = [ShadowLight::zeroed(); SHADOW_CHANNELS];
+    let views = light_views(&extracted);
     let shade_view = state.frame.shade_target.as_ref().unwrap().view.clone();
     let environment_map = layout_key.contains(MeshPipelineViewLayoutKey::ENVIRONMENT_MAP);
 
@@ -366,7 +385,12 @@ pub fn hair_pass(
         .attachment
         .depth_stencil_views()
         .depth_only_view()
-        .filter(|_| depth.texture().usage().contains(TextureUsages::TEXTURE_BINDING))
+        .filter(|_| {
+            depth
+                .texture()
+                .usage()
+                .contains(TextureUsages::TEXTURE_BINDING)
+        })
         .unwrap_or_else(|| state.frame.dummy_depth.as_ref().unwrap());
 
     let targets = state.frame.targets.as_ref().unwrap();
@@ -396,11 +420,17 @@ pub fn hair_pass(
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(pixels.div_ceil(256), 1, 1);
         }
-        let (light_eye, light_dir, light_clip, light_near, light_far) = light_fit(
-            gpu,
-            groom.world_from_model,
-            key_direction(&extracted.directionals),
-        );
+        let key = views.last().expect("the key view is always present");
+        let Some(LightFit {
+            eye: light_eye,
+            forward: light_dir,
+            clip: light_clip,
+            near: light_near,
+            far: light_far,
+        }) = key.source.fit(gpu, groom.world_from_model)
+        else {
+            continue;
+        };
         let (center, radius) = world_extent(gpu, groom.world_from_model);
         let dist = camera_pos.distance(center).max(0.5);
         // 24-bit quantization stays precise across the whole view, so the range
@@ -426,31 +456,7 @@ pub fn hair_pass(
             pass_mode: [0, gpu.bundle_count, u32::from(reverse), 0],
             light_eye,
         });
-        let dom_params = make_params(ViewArgs {
-            clip_from_world: light_clip,
-            world_from_clip: light_clip.inverse(),
-            world_from_model: groom.world_from_model,
-            light_clip_from_world: light_clip,
-            camera_pos: light_eye,
-            camera_forward: light_dir,
-            screen: Vec4::new(DOM_SIZE as f32, DOM_SIZE as f32, light_near, light_far),
-            groom,
-            light_forward: light_dir,
-            dom_near: light_near,
-            dom_far: light_far,
-            dom_scale,
-            pass_mode: [1, gpu.bundle_count, u32::from(reverse), 1],
-            light_eye,
-        });
-        let mut dom_opacity_params = dom_params;
-        dom_opacity_params.pass_mode[0] = 2;
         queue.write_buffer(&gpu.camera_params, 0, bytemuck::bytes_of(&camera_params));
-        queue.write_buffer(&gpu.dom_params, 0, bytemuck::bytes_of(&dom_params));
-        queue.write_buffer(
-            &gpu.dom_opacity_params,
-            0,
-            bytemuck::bytes_of(&dom_opacity_params),
-        );
 
         let groups = (gpu.bundle_count.div_ceil(64), 1, 1);
         dispatch(
@@ -495,88 +501,49 @@ pub fn hair_pass(
         );
 
         if groom.deep_opacity {
-            // Depth texels, then DOM_LAYERS opacity counts. Two rasters: the
-            // second bins fragments relative to the nearest depth from the first.
-            let dom_words = DOM_SIZE * DOM_SIZE * (1 + DOM_LAYERS);
-            {
-                let group = ctx.render_device().create_bind_group(
-                    None,
-                    &cache.get_bind_group_layout(&pipelines.clear_dom_layout),
-                    &BindGroupEntries::sequential((targets.dom.as_entire_binding(),)),
-                );
-                let mut pass = ctx
-                    .command_encoder()
-                    .begin_compute_pass(&ComputePassDescriptor {
-                        label: Some("hair_clear_dom"),
-                        ..default()
-                    });
-                pass.set_pipeline(clear_dom);
-                pass.set_bind_group(0, &group, &[]);
-                pass.dispatch_workgroups(dom_words.div_ceil(256), 1, 1);
-            }
-            dispatch(
-                &mut ctx,
-                &cache,
+            let dom = DomPasses {
+                clear_dom,
                 lod,
-                &pipelines.lod_layout,
-                BindGroupEntries::sequential((
-                    gpu.dom_params.as_entire_binding(),
-                    gpu.bundles.as_entire_binding(),
-                    gpu.layers.as_entire_binding(),
-                    gpu.dom_lod.as_entire_binding(),
-                )),
-                groups,
-            );
-            dispatch(
-                &mut ctx,
-                &cache,
                 scan,
-                &pipelines.scan_layout,
-                BindGroupEntries::sequential((
-                    gpu.dom_params.as_entire_binding(),
-                    gpu.dom_lod.as_entire_binding(),
-                    gpu.dom_refs.as_entire_binding(),
-                    gpu.dom_indirect.as_entire_binding(),
-                )),
-                (1, 1, 1),
-            );
-            dispatch_raster(
-                &mut ctx,
-                &cache,
                 raster,
-                &pipelines.raster_layout,
-                RasterBuffers {
-                    gpu,
-                    params: &gpu.dom_params,
-                    refs: &gpu.dom_refs,
-                    targets,
-                    depth_view,
-                    indirect: &gpu.dom_indirect,
-                },
-            );
-            dispatch_raster(
-                &mut ctx,
-                &cache,
-                raster,
-                &pipelines.raster_layout,
-                RasterBuffers {
-                    gpu,
-                    params: &gpu.dom_opacity_params,
-                    refs: &gpu.dom_refs,
-                    targets,
-                    depth_view,
-                    indirect: &gpu.dom_indirect,
-                },
-            );
-            if let Some(dst) = shadow_dom {
-                ctx.command_encoder()
-                    .copy_buffer_to_buffer(&targets.dom, 0, &dst.buffer, 0, DOM_BYTES);
-                shadow_light = ShadowLight {
-                    light_clip_from_world: light_clip.to_cols_array_2d(),
-                    light_eye: light_eye.extend(1.0).to_array(),
-                    light_forward: light_dir.extend(0.0).to_array(),
-                    depth: [light_near, light_far, DOM_SIGMA, 1.0],
+                pipelines: &pipelines,
+                targets,
+                depth_view,
+                queue: &queue,
+                reverse,
+            };
+            // The key's map renders last so shading reads it from `targets.dom`.
+            for (slot, view) in views.iter().enumerate() {
+                let Some(fit) = view.source.fit(gpu, groom.world_from_model) else {
+                    continue;
                 };
+                render_dom(
+                    &mut ctx,
+                    &cache,
+                    &dom,
+                    gpu,
+                    groom,
+                    &gpu.dom_params[slot],
+                    &fit,
+                );
+                let Some(channel) = view.channel else {
+                    continue;
+                };
+                if let Some(dst) = shadow_dom {
+                    ctx.command_encoder().copy_buffer_to_buffer(
+                        &targets.dom,
+                        0,
+                        &dst.buffer,
+                        channel as u64 * DOM_BYTES,
+                        DOM_BYTES,
+                    );
+                    shadow_lights[channel as usize] = ShadowLight {
+                        light_clip_from_world: fit.clip.to_cols_array_2d(),
+                        light_eye: fit.eye.extend(1.0).to_array(),
+                        light_forward: fit.forward.extend(0.0).to_array(),
+                        depth: [fit.near, fit.far, DOM_SIGMA, 1.0],
+                    };
+                }
             }
         }
 
@@ -645,13 +612,13 @@ pub fn hair_pass(
     // The queue write lands before this frame's commands, so the copy below
     // publishes it alongside the map copied above.
     if let Some(dst) = shadow_light_dst {
-        queue.write_buffer(&shadow_light_src, 0, bytemuck::bytes_of(&shadow_light));
+        queue.write_buffer(&shadow_light_src, 0, bytemuck::cast_slice(&shadow_lights));
         ctx.command_encoder().copy_buffer_to_buffer(
             &shadow_light_src,
             0,
             &dst.buffer,
             0,
-            SHADOW_LIGHT_BYTES,
+            SHADOW_LIGHT_BYTES * SHADOW_CHANNELS as u64,
         );
     }
 }
@@ -708,14 +675,52 @@ fn make_params(args: ViewArgs) -> HairParams {
     }
 }
 
-fn key_direction(lights: &[ExtractedDirectional]) -> Vec3 {
+/// Where a deep opacity map looks from.
+enum LightSource {
+    Directional(Vec3),
+    Positional(Vec3),
+}
+
+struct LightView {
+    source: LightSource,
+    channel: Option<u8>,
+}
+
+/// The maps to render this frame: every channel light, then the key
+/// directional, whose map also drives hair self-shadowing.
+fn light_views(extracted: &ExtractedFrame) -> Vec<LightView> {
+    let lights = &extracted.directionals;
+    let key = key_index(lights);
+    let mut views: Vec<LightView> = lights
+        .iter()
+        .enumerate()
+        .filter(|&(index, _)| Some(index) != key)
+        .filter_map(|(_, light)| {
+            light.channel.map(|channel| LightView {
+                source: LightSource::Directional(light.direction_to_light),
+                channel: Some(channel),
+            })
+        })
+        .chain(extracted.positionals.iter().map(|light| LightView {
+            source: LightSource::Positional(light.position),
+            channel: Some(light.channel),
+        }))
+        .collect();
+    views.push(LightView {
+        source: LightSource::Directional(
+            key.map(|index| lights[index].direction_to_light)
+                .unwrap_or_else(|| Vec3::new(0.35, 0.82, 0.45)),
+        ),
+        channel: key.and_then(|index| lights[index].channel),
+    });
+    views
+}
+
+fn key_index(lights: &[ExtractedDirectional]) -> Option<usize> {
     lights
         .iter()
-        .find(|light| light.casts_shadows)
-        .or_else(|| lights.first())
-        .map(|light| light.direction_to_light)
-        .unwrap_or_else(|| Vec3::new(0.35, 0.82, 0.45))
-        .normalize_or(Vec3::Y)
+        .position(|light| light.casts_shadows)
+        .or((!lights.is_empty()).then_some(0))
 }
 
 fn world_corners(gpu: &GpuGroom, world_from_model: Mat4) -> [Vec3; 8] {
@@ -744,35 +749,184 @@ fn world_extent(gpu: &GpuGroom, world_from_model: Mat4) -> (Vec3, f32) {
     (center, radius)
 }
 
-fn light_fit(
-    gpu: &GpuGroom,
-    world_from_model: Mat4,
-    direction_to_light: Vec3,
-) -> (Vec3, Vec3, Mat4, f32, f32) {
-    let (center, radius) = world_extent(gpu, world_from_model);
-    let to_light = direction_to_light.normalize_or(Vec3::Y);
-    let forward = -to_light;
-    let eye = center + to_light * radius;
-    let mut near = f32::MAX;
-    let mut far = f32::MIN;
-    for corner in world_corners(gpu, world_from_model) {
-        let depth = (corner - eye).dot(forward);
-        near = near.min(depth);
-        far = far.max(depth);
+struct LightFit {
+    eye: Vec3,
+    forward: Vec3,
+    clip: Mat4,
+    near: f32,
+    far: f32,
+}
+
+impl LightSource {
+    /// A light view that just contains the groom: orthographic for a
+    /// directional, a perspective cone for a point or spot. `None` when the
+    /// light is inside the groom's bounds.
+    fn fit(&self, gpu: &GpuGroom, world_from_model: Mat4) -> Option<LightFit> {
+        let (center, radius) = world_extent(gpu, world_from_model);
+        let (eye, forward) = match *self {
+            LightSource::Directional(to_light) => {
+                let to_light = to_light.normalize_or(Vec3::Y);
+                (center + to_light * radius, -to_light)
+            }
+            LightSource::Positional(position) => {
+                if position.distance(center) <= radius * 1.05 {
+                    return None;
+                }
+                (position, (center - position).normalize())
+            }
+        };
+        let mut near = f32::MAX;
+        let mut far = f32::MIN;
+        for corner in world_corners(gpu, world_from_model) {
+            let depth = (corner - eye).dot(forward);
+            near = near.min(depth);
+            far = far.max(depth);
+        }
+        near = (near - radius * 0.05).max(0.05);
+        far = (far + radius * 0.05).max(near + 1.0);
+        let up = if forward.dot(Vec3::Y).abs() > 0.95 {
+            Vec3::Z
+        } else {
+            Vec3::Y
+        };
+        let view = Transform::from_translation(eye)
+            .looking_to(forward, up)
+            .to_matrix()
+            .inverse();
+        let proj = match *self {
+            LightSource::Directional(_) => {
+                bevy::math::proj::orthographic(-radius, radius, -radius, radius, near, far)
+            }
+            LightSource::Positional(_) => {
+                let half = (radius / eye.distance(center)).asin();
+                bevy::math::proj::perspective(half * 2.0, 1.0, near, far)
+            }
+        };
+        Some(LightFit {
+            eye,
+            forward,
+            clip: proj * view,
+            near,
+            far,
+        })
     }
-    near = (near - radius * 0.05).max(0.05);
-    far = (far + radius * 0.05).max(near + 1.0);
-    let up = if forward.dot(Vec3::Y).abs() > 0.95 {
-        Vec3::Z
-    } else {
-        Vec3::Y
-    };
-    let view = Transform::from_translation(eye)
-        .looking_to(forward, up)
-        .to_matrix()
-        .inverse();
-    let proj = bevy::math::proj::orthographic(-radius, radius, -radius, radius, near, far);
-    (eye, forward, proj * view, near, far)
+}
+
+struct DomPasses<'a> {
+    clear_dom: &'a ComputePipeline,
+    lod: &'a ComputePipeline,
+    scan: &'a ComputePipeline,
+    raster: &'a ComputePipeline,
+    pipelines: &'a HairPipelines,
+    targets: &'a ScreenTargets,
+    depth_view: &'a TextureView,
+    queue: &'a RenderQueue,
+    reverse: bool,
+}
+
+/// Renders the groom's deep opacity map from `fit` into `targets.dom`. Depth
+/// texels, then `DOM_LAYERS` opacity counts. Two rasters: the second bins
+/// fragments relative to the nearest depth from the first.
+fn render_dom(
+    ctx: &mut RenderContext,
+    cache: &PipelineCache,
+    dom: &DomPasses,
+    gpu: &GpuGroom,
+    groom: &ExtractedGroom,
+    params: &DomParams,
+    fit: &LightFit,
+) {
+    let DomPasses {
+        clear_dom,
+        lod,
+        scan,
+        raster,
+        pipelines,
+        targets,
+        depth_view,
+        queue,
+        reverse,
+    } = *dom;
+    let depth_params = make_params(ViewArgs {
+        clip_from_world: fit.clip,
+        world_from_clip: fit.clip.inverse(),
+        world_from_model: groom.world_from_model,
+        light_clip_from_world: fit.clip,
+        camera_pos: fit.eye,
+        camera_forward: fit.forward,
+        screen: Vec4::new(DOM_SIZE as f32, DOM_SIZE as f32, fit.near, fit.far),
+        groom,
+        light_forward: fit.forward,
+        dom_near: fit.near,
+        dom_far: fit.far,
+        dom_scale: (fit.far - fit.near) / LAYER_COUNT as f32,
+        pass_mode: [1, gpu.bundle_count, u32::from(reverse), 1],
+        light_eye: fit.eye,
+    });
+    let mut opacity_params = depth_params;
+    opacity_params.pass_mode[0] = 2;
+    queue.write_buffer(&params.depth, 0, bytemuck::bytes_of(&depth_params));
+    queue.write_buffer(&params.opacity, 0, bytemuck::bytes_of(&opacity_params));
+
+    let dom_words = DOM_SIZE * DOM_SIZE * (1 + DOM_LAYERS);
+    {
+        let group = ctx.render_device().create_bind_group(
+            None,
+            &cache.get_bind_group_layout(&pipelines.clear_dom_layout),
+            &BindGroupEntries::sequential((targets.dom.as_entire_binding(),)),
+        );
+        let mut pass = ctx
+            .command_encoder()
+            .begin_compute_pass(&ComputePassDescriptor {
+                label: Some("hair_clear_dom"),
+                ..default()
+            });
+        pass.set_pipeline(clear_dom);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups(dom_words.div_ceil(256), 1, 1);
+    }
+    dispatch(
+        ctx,
+        cache,
+        lod,
+        &pipelines.lod_layout,
+        BindGroupEntries::sequential((
+            params.depth.as_entire_binding(),
+            gpu.bundles.as_entire_binding(),
+            gpu.layers.as_entire_binding(),
+            gpu.dom_lod.as_entire_binding(),
+        )),
+        (gpu.bundle_count.div_ceil(64), 1, 1),
+    );
+    dispatch(
+        ctx,
+        cache,
+        scan,
+        &pipelines.scan_layout,
+        BindGroupEntries::sequential((
+            params.depth.as_entire_binding(),
+            gpu.dom_lod.as_entire_binding(),
+            gpu.dom_refs.as_entire_binding(),
+            gpu.dom_indirect.as_entire_binding(),
+        )),
+        (1, 1, 1),
+    );
+    for params in [&params.depth, &params.opacity] {
+        dispatch_raster(
+            ctx,
+            cache,
+            raster,
+            &pipelines.raster_layout,
+            RasterBuffers {
+                gpu,
+                params,
+                refs: &gpu.dom_refs,
+                targets,
+                depth_view,
+                indirect: &gpu.dom_indirect,
+            },
+        );
+    }
 }
 
 fn depth_is_reverse(clip: Mat4, camera: Vec3, forward: Vec3) -> bool {
@@ -805,12 +959,7 @@ fn ensure_targets(device: &RenderDevice, frame: &mut FrameGpu, width: u32, heigh
         shaded_depth: zeros(device, "hair_shaded_z", pixels * 4, BufferKind::Storage),
         filtered: zeros(device, "hair_filtered", pixels * 16, BufferKind::Storage),
         filtered_depth: zeros(device, "hair_filtered_z", pixels * 4, BufferKind::Storage),
-        dom: zeros(
-            device,
-            "hair_dom",
-            DOM_BYTES,
-            BufferKind::SharedStorage,
-        ),
+        dom: zeros(device, "hair_dom", DOM_BYTES, BufferKind::SharedStorage),
     });
 }
 
@@ -1079,6 +1228,11 @@ mod dom_layout {
         );
         assert!(clear.contains(&size), "{size} missing from clear_dom.wgsl");
         let receiver = include_str!("shaders/hair_shadow.wesl");
+        let channels = format!("const CHANNELS: u32 = {}u;", super::SHADOW_CHANNELS);
+        assert!(
+            receiver.contains(&channels),
+            "{channels} missing from hair_shadow.wesl"
+        );
         assert!(
             receiver.contains(&layers),
             "{layers} missing from hair_shadow.wesl"

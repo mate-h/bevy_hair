@@ -18,7 +18,7 @@ use std::fmt;
 
 use bevy::app::{PluginGroup, RunFixedMainLoop, RunFixedMainLoopSystems};
 use bevy::camera::Hdr;
-use bevy::light::CascadeShadowConfigBuilder;
+use bevy::light::{CascadeShadowConfigBuilder, CustomShadowChannel};
 use bevy::log::LogPlugin;
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
@@ -68,7 +68,10 @@ fn main() {
                 .after(run_freecamera_controller)
                 .in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop),
         )
-        .add_systems(Update, (controls, draw_cages, apply_rig, spin_environment).chain())
+        .add_systems(
+            Update,
+            (controls, draw_cages, apply_rig, spin_environment).chain(),
+        )
         .run();
 }
 
@@ -268,9 +271,8 @@ fn setup(
             let heading = Vec3::new(150.0, 0.0, 40.0).normalize();
             let pitch = 15.0_f32.to_radians();
             let distance = 431.0;
-            let eye = focus
-                + heading * (distance * pitch.cos())
-                + Vec3::Y * (distance * pitch.sin());
+            let eye =
+                focus + heading * (distance * pitch.cos()) + Vec3::Y * (distance * pitch.sin());
             Transform::from_translation(eye).looking_at(focus, Vec3::Y)
         },
         FreeCamera {
@@ -307,6 +309,7 @@ fn setup(
         }
         .build(),
         Transform::from_translation(key).looking_at(focus, Vec3::Y),
+        CustomShadowChannel(0),
     ));
 
     // Studio directions in the opening camera's frame. `right` is screen right.
@@ -316,7 +319,7 @@ fn setup(
         studio: true,
         key_dir: (heading * 0.45 - right * 0.8 + Vec3::Y * 0.55).normalize(),
     });
-    // Soft cool fill opposite the key. It casts no shadows.
+    // Soft cool fill opposite the key. Only the hair shadows it.
     let fill = (heading * 0.7 + right * 0.7 + Vec3::Y * 0.1).normalize();
     commands.spawn((
         PointLight {
@@ -327,6 +330,7 @@ fn setup(
             ..default()
         },
         Transform::from_translation(focus + fill * STUDIO_DISTANCE),
+        CustomShadowChannel(1),
         StudioLight,
     ));
     // Rim from behind and above. Its shadow map lets the head block it from
@@ -343,6 +347,7 @@ fn setup(
             ..default()
         },
         Transform::from_translation(focus + rim * STUDIO_DISTANCE).looking_at(focus, Vec3::Y),
+        CustomShadowChannel(2),
         StudioLight,
     ));
 }
@@ -418,7 +423,11 @@ fn apply_rig(
         rig.studio = !rig.studio;
         info!(
             "lighting: {}",
-            if rig.studio { "studio" } else { "environment sun" }
+            if rig.studio {
+                "studio"
+            } else {
+                "environment sun"
+            }
         );
     }
     if !rig.is_changed() {

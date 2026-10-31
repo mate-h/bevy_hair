@@ -4,11 +4,12 @@ mod pipeline;
 use std::collections::HashMap;
 
 use bevy::asset::AssetId;
+use bevy::asset::{RenderAssetUsages, embedded_asset};
 use bevy::camera::visibility::Visibility;
 use bevy::core_pipeline::core_3d::{main_opaque_pass_3d, main_transparent_pass_3d};
 use bevy::core_pipeline::{Core3d, Core3dSystems};
-use bevy::asset::{RenderAssetUsages, embedded_asset};
 use bevy::ecs::system::ResMut;
+use bevy::light::{CustomShadowChannel, MAX_CUSTOM_SHADOW_CHANNELS};
 use bevy::math::{Mat4, Vec3, Vec4};
 use bevy::pbr::MeshPipelineSystems;
 use bevy::prelude::*;
@@ -54,11 +55,11 @@ impl Plugin for HairPlugin {
         if let Some(mut buffers) = app.world_mut().get_resource_mut::<Assets<ShaderBuffer>>() {
             let shadow = HairShadow {
                 dom: buffers.add(ShaderBuffer::with_size(
-                    pass::DOM_BYTES,
+                    pass::DOM_BYTES * pass::SHADOW_CHANNELS as u64,
                     RenderAssetUsages::RENDER_WORLD,
                 )),
                 light: buffers.add(ShaderBuffer::with_size(
-                    pass::SHADOW_LIGHT_BYTES,
+                    pass::SHADOW_LIGHT_BYTES * pass::SHADOW_CHANNELS as u64,
                     RenderAssetUsages::RENDER_WORLD,
                 )),
             };
@@ -84,6 +85,8 @@ impl Plugin for HairPlugin {
 pub(crate) struct ExtractedFrame {
     pub grooms: Vec<ExtractedGroom>,
     pub directionals: Vec<ExtractedDirectional>,
+    /// Point and spot lights on a custom shadow channel.
+    pub positionals: Vec<ExtractedPositional>,
     meshes: HashMap<AssetId<HairMesh>, HairMesh>,
 }
 
@@ -104,16 +107,44 @@ pub(crate) struct ExtractedGroom {
 pub(crate) struct ExtractedDirectional {
     direction_to_light: Vec3,
     casts_shadows: bool,
+    channel: Option<u8>,
+}
+
+pub(crate) struct ExtractedPositional {
+    position: Vec3,
+    channel: u8,
+}
+
+type DirectionalCaster = (
+    &'static DirectionalLight,
+    &'static GlobalTransform,
+    Option<&'static CustomShadowChannel>,
+);
+
+type PositionalCaster = (
+    &'static GlobalTransform,
+    &'static CustomShadowChannel,
+    &'static InheritedVisibility,
+);
+
+type PositionalLight = Or<(With<PointLight>, With<SpotLight>)>;
+
+fn valid_channel(channel: Option<&CustomShadowChannel>) -> Option<u8> {
+    channel
+        .map(|channel| channel.0)
+        .filter(|&channel| channel < MAX_CUSTOM_SHADOW_CHANNELS)
 }
 
 fn extract_hair(
     grooms: Extract<Query<(&HairGroom, &GlobalTransform, Option<&Visibility>)>>,
-    lights: Extract<Query<(&DirectionalLight, &GlobalTransform)>>,
+    lights: Extract<Query<DirectionalCaster>>,
+    positionals: Extract<Query<PositionalCaster, PositionalLight>>,
     meshes: Extract<Res<Assets<HairMesh>>>,
     mut extracted: ResMut<ExtractedFrame>,
 ) {
     extracted.grooms.clear();
     extracted.directionals.clear();
+    extracted.positionals.clear();
     for (groom, transform, visibility) in &grooms {
         if visibility.is_some_and(|visibility| *visibility == Visibility::Hidden) {
             continue;
@@ -138,10 +169,20 @@ fn extract_hair(
             center_diameter: groom.center_diameter,
         });
     }
-    for (light, transform) in &lights {
+    for (light, transform, channel) in &lights {
         extracted.directionals.push(ExtractedDirectional {
             direction_to_light: transform.back().as_vec3(),
             casts_shadows: light.shadow_maps_enabled,
+            channel: valid_channel(channel),
+        });
+    }
+    for (transform, channel, visibility) in &positionals {
+        let Some(channel) = valid_channel(Some(channel)).filter(|_| visibility.get()) else {
+            continue;
+        };
+        extracted.positionals.push(ExtractedPositional {
+            position: transform.translation(),
+            channel,
         });
     }
 }

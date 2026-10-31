@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-bevy = { version = "0.20.1", features = ["3d"] }
+bevy = { git = "https://github.com/mate-h/bevy", branch = "m/shadow-factors", features = ["3d"] }
 bytemuck = { version = "1", features = ["derive"] }
 
 [[example]]
@@ -19,5 +19,5 @@ name = "groom"
 path = "examples/groom.rs"
 
 [dev-dependencies]
-bevy_camera_controller = { version = "0.20.1", features = ["free_camera"] }
+bevy_camera_controller = { git = "https://github.com/mate-h/bevy", branch = "m/shadow-factors", features = ["free_camera"] }
 naga = { version = "30.0.1", features = ["wgsl-in"] }
