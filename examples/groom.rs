@@ -66,7 +66,7 @@ fn main() {
                 .after(run_freecamera_controller)
                 .in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop),
         )
-        .add_systems(Update, (controls, draw_cages, spin_environment))
+        .add_systems(Update, (controls, draw_cages, apply_rig, spin_environment).chain())
         .run();
 }
 
@@ -85,7 +85,8 @@ bevy_hair Controls:
     {:?}\t- Toggle deep opacity map
     {:?} & {:?}\t- Decrease and increase lambda
     {:?}\t- Toggle bundle cage wireframe
-    {:?}\t- Spin the environment and key light",
+    {:?}\t- Switch studio and environment-sun lighting
+    {:?}\t- Spin the environment (and the sun outside the studio)",
             KeyCode::Digit1,
             KeyCode::Digit2,
             KeyCode::Digit3,
@@ -96,6 +97,7 @@ bevy_hair Controls:
             KeyCode::BracketLeft,
             KeyCode::BracketRight,
             KeyCode::KeyC,
+            KeyCode::KeyK,
             KeyCode::Space,
         )
     }
@@ -111,6 +113,42 @@ fn print_groom_controls(mut printed: Local<bool>, cameras: Query<(), With<Camera
 
 #[derive(Resource)]
 struct ShowCage(bool);
+
+// One scale for the face IBL and the hair probe lookup.
+// The bake stores EXR radiance. Reinhard with white point 1 crushes the
+// sun in the IBL (specular mip 0 peaks at 1).
+// `ENV_INTENSITY` is cd/m² per EXR unit. The solar disk integrates to
+// 10.7 lux per EXR unit on a facing surface, measured on
+// little_paris_eiffel_tower_2k.exr.
+const ENV_INTENSITY: f32 = 2_000.0;
+const SUN_ILLUMINANCE_PER_EXR: f32 = 10.7;
+const KEY_LIGHT_INTENSITY: f32 = ENV_INTENSITY * SUN_ILLUMINANCE_PER_EXR;
+// Disk color: energy-weighted RGB over luminance, so `illuminance` stays in lux.
+const SUN_COLOR: Color = Color::linear_rgb(1.282, 0.964, 0.526);
+
+// Studio rig, in lux at the head. The environment drops to a dim ambient.
+const STUDIO_ENV_INTENSITY: f32 = 400.0;
+const STUDIO_KEY_LUX: f32 = 16_000.0;
+// About 4:1 key to fill where the key reaches the face at 60°.
+const STUDIO_FILL_LUX: f32 = 1_500.0;
+const STUDIO_RIM_LUX: f32 = 30_000.0;
+const STUDIO_DISTANCE: f32 = 220.0;
+
+/// Point and spot intensity in lumens that lights `distance` away to `lux`.
+fn lumens_for(lux: f32, distance: f32) -> f32 {
+    lux * 4.0 * std::f32::consts::PI * distance * distance
+}
+
+/// Key, fill, and rim. The key is the one shadowed directional, so it keeps
+/// the deep opacity map. `K` swaps it for the environment's sun.
+#[derive(Resource)]
+struct LightRig {
+    studio: bool,
+    key_dir: Vec3,
+}
+
+#[derive(Component)]
+struct StudioLight;
 
 #[derive(Resource)]
 struct EnvTurntable {
@@ -181,7 +219,8 @@ fn setup(
         HairGroom {
             mesh: handles[0].clone(),
             // Roughness picks a prefiltered specular mip. Tilt shifts the primary R highlight.
-            albedo: Color::srgb(0.32, 0.21, 0.13),
+            // Albedo is the multiple-scattered color; the shader solves for absorption.
+            albedo: Color::srgb(0.27, 0.20, 0.15),
             roughness: 0.45,
             tilt: 0.05,
             ..default()
@@ -190,15 +229,6 @@ fn setup(
     ));
     commands.insert_resource(GroomLibrary { handles, active: 0 });
 
-    // One scale for the face IBL and the hair probe lookup.
-    // The bake stores EXR radiance. Reinhard with white point 1 crushes the
-    // sun in the IBL (specular mip 0 peaks at 1).
-    // `ENV_INTENSITY` is cd/m² per EXR unit. The solar disk integrates to
-    // 10.7 lux per EXR unit on a facing surface, measured on
-    // little_paris_eiffel_tower_2k.exr.
-    const ENV_INTENSITY: f32 = 2_000.0;
-    const SUN_ILLUMINANCE_PER_EXR: f32 = 10.7;
-    const KEY_LIGHT_INTENSITY: f32 = ENV_INTENSITY * SUN_ILLUMINANCE_PER_EXR;
     // Environment sun, 12° up. Startup yaw matches `EnvTurntable::angle`.
     let sun_dir = Vec3::new(0.788, 0.217, 0.576).normalize();
     let env_angle = FRAC_PI_2;
@@ -246,9 +276,8 @@ fn setup(
         },
     ));
 
-    // Replaces the disk the bake removed. Color is the disk's energy-weighted
-    // RGB divided by its luminance, so `illuminance` stays in lux.
-    // Exposure stays at EV 9.7. `spin_environment` continues from this yaw.
+    // Replaces the disk the bake removed. Exposure stays at EV 9.7.
+    // `spin_environment` continues from this yaw.
     let key = focus + (env_yaw * sun_dir) * 120.0;
     commands.insert_resource(EnvTurntable {
         spinning: false,
@@ -258,7 +287,7 @@ fn setup(
     });
     commands.spawn((
         DirectionalLight {
-            color: Color::linear_rgb(1.282, 0.964, 0.526),
+            color: SUN_COLOR,
             illuminance: KEY_LIGHT_INTENSITY,
             shadow_maps_enabled: true,
             ..default()
@@ -271,6 +300,43 @@ fn setup(
         }
         .build(),
         Transform::from_translation(key).looking_at(focus, Vec3::Y),
+    ));
+
+    // Studio directions in the opening camera's frame. `right` is screen right.
+    let heading = Vec3::new(150.0, 0.0, 40.0).normalize();
+    let right = Vec3::Y.cross(heading);
+    commands.insert_resource(LightRig {
+        studio: true,
+        key_dir: (heading * 0.45 - right * 0.8 + Vec3::Y * 0.55).normalize(),
+    });
+    // Soft cool fill opposite the key. It casts no shadows.
+    let fill = (heading * 0.7 + right * 0.7 + Vec3::Y * 0.1).normalize();
+    commands.spawn((
+        PointLight {
+            color: Color::srgb(0.80, 0.88, 1.0),
+            intensity: lumens_for(STUDIO_FILL_LUX, STUDIO_DISTANCE),
+            range: 2_000.0,
+            radius: 40.0,
+            ..default()
+        },
+        Transform::from_translation(focus + fill * STUDIO_DISTANCE),
+        StudioLight,
+    ));
+    // Rim from behind and above. Its shadow map lets the head block it from
+    // the hair in front, so only the outline and crown catch the TT glow.
+    let rim = (-heading * 0.8 + right * 0.35 + Vec3::Y * 0.6).normalize();
+    commands.spawn((
+        SpotLight {
+            intensity: lumens_for(STUDIO_RIM_LUX, STUDIO_DISTANCE),
+            range: 2_000.0,
+            radius: 20.0,
+            inner_angle: 0.3,
+            outer_angle: 0.5,
+            shadow_maps_enabled: true,
+            ..default()
+        },
+        Transform::from_translation(focus + rim * STUDIO_DISTANCE).looking_at(focus, Vec3::Y),
+        StudioLight,
     ));
 }
 
@@ -333,9 +399,55 @@ fn controls(
     }
 }
 
+fn apply_rig(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut rig: ResMut<LightRig>,
+    turntable: Res<EnvTurntable>,
+    mut key: Query<(&mut DirectionalLight, &mut Transform)>,
+    mut studio_lights: Query<&mut Visibility, With<StudioLight>>,
+    mut environment: Query<&mut EnvironmentMapLight>,
+) {
+    if keys.just_pressed(KeyCode::KeyK) {
+        rig.studio = !rig.studio;
+        info!(
+            "lighting: {}",
+            if rig.studio { "studio" } else { "environment sun" }
+        );
+    }
+    if !rig.is_changed() {
+        return;
+    }
+    if let Ok((mut light, mut transform)) = key.single_mut() {
+        if rig.studio {
+            light.color = Color::srgb(1.0, 0.96, 0.9);
+            light.illuminance = STUDIO_KEY_LUX;
+            *transform = Transform::from_translation(turntable.focus + rig.key_dir * 120.0)
+                .looking_at(turntable.focus, Vec3::Y);
+        } else {
+            light.color = SUN_COLOR;
+            light.illuminance = KEY_LIGHT_INTENSITY;
+        }
+    }
+    for mut visibility in &mut studio_lights {
+        *visibility = if rig.studio {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+    }
+    if let Ok(mut light) = environment.single_mut() {
+        light.intensity = if rig.studio {
+            STUDIO_ENV_INTENSITY
+        } else {
+            ENV_INTENSITY
+        };
+    }
+}
+
 fn spin_environment(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
+    rig: Res<LightRig>,
     mut turntable: ResMut<EnvTurntable>,
     mut lights: Query<&mut Transform, With<DirectionalLight>>,
     mut environment: Query<&mut EnvironmentMapLight>,
@@ -352,6 +464,9 @@ fn spin_environment(
     let yaw = Quat::from_rotation_y(turntable.angle);
     if let Ok(mut light) = environment.single_mut() {
         light.rotation = yaw;
+    }
+    if rig.studio {
+        return;
     }
     if let Ok(mut transform) = lights.single_mut() {
         let dir = yaw * turntable.sun_dir;

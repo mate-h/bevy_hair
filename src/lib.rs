@@ -31,6 +31,8 @@ pub use render::HairPlugin;
 pub struct HairGroom {
     pub mesh: Handle<HairMesh>,
     pub lambda: f32,
+    /// Multiple-scattered hair color. The shader solves for the fiber absorption
+    /// that produces it.
     pub albedo: Color,
     pub roughness: f32,
     pub tilt: f32,

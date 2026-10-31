@@ -24,13 +24,29 @@ fn vs(@builtin(vertex_index) vertex_index: u32) -> FullscreenVertexOutput {
     return fullscreen_vertex_shader(vertex_index);
 }
 
-// Karis 2016, "Physically Based Hair Shading in Unreal". Longitudinal lobes are
-// Gaussians in θi + θo. Azimuthal TT and TRT use his fitted exponentials, and
-// absorption raises the albedo to the internal path length.
-const SCATTER: f32 = 0.5;
+// Single scattering follows Karis 2016, "Physically Based Hair Shading in
+// Unreal". Longitudinal lobes are Gaussians in θi + θo. Azimuthal TT and TRT
+// use his fitted exponentials, and absorption raises the albedo to the
+// internal path length.
+//
+// Multiple scattering follows Zinke et al. 2008, "Dual Scattering
+// Approximation for Fast Multiple Scattering in Hair". Global forward
+// scattering spreads light through the strands the deep opacity map counts
+// toward the light. Local backscattering returns light from the neighbors.
+
+// Density factors d_f and d_b from the paper.
+const DENSITY_FRONT: f32 = 0.7;
+const DENSITY_BACK: f32 = 0.7;
+// Azimuthal samples per quarter turn for the attenuation integrals.
+const SCATTER_STEPS: u32 = 8u;
 
 fn gaussian(b: f32, x: f32) -> f32 {
     return exp(-0.5 * x * x / (b * b)) / (sqrt(2.0 * PI) * b);
+}
+
+fn gaussian3(b: vec3<f32>, x: vec3<f32>) -> vec3<f32> {
+    let bb = max(b, vec3<f32>(1e-3));
+    return exp(-0.5 * x * x / (bb * bb)) / (sqrt(2.0 * PI) * bb);
 }
 
 fn fresnel(cos_t: f32) -> f32 {
@@ -42,6 +58,19 @@ fn luminance(c: vec3<f32>) -> f32 {
     return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
+// Chiang et al. 2016, "A Practical and Controllable Hair and Fur Model for
+// Production Path Tracing", Eq. 9. The absorption coefficient σa whose
+// multiple-scattered color is `color`, so the groom albedo reads as the
+// perceived hair color.
+fn absorption_from_color(color: vec3<f32>, roughness: f32) -> vec3<f32> {
+    let b = clamp(roughness, 0.0, 1.0);
+    let b2 = b * b;
+    let b3 = b2 * b;
+    let d = 5.969 - 0.215 * b + 2.532 * b2 - 10.73 * b3 + 5.574 * b2 * b2 + 0.245 * b3 * b2;
+    let l = log(clamp(color, vec3<f32>(1e-4), vec3<f32>(1.0))) / d;
+    return l * l;
+}
+
 // Light that reaches the fiber through other hair is tinted by every bounce.
 // The more of the direct light is shadowed, the more saturated the remainder.
 fn scatter_tint(albedo: vec3<f32>, shadow: f32) -> vec3<f32> {
@@ -50,15 +79,121 @@ fn scatter_tint(albedo: vec3<f32>, shadow: f32) -> vec3<f32> {
     return pow(hue, vec3<f32>(0.5 - 0.5 * clamp(shadow, 0.0, 1.0)));
 }
 
+struct Lobes {
+    r: vec3<f32>,
+    tt: vec3<f32>,
+    trt: vec3<f32>,
+}
+
+// Azimuthal scattering N_p with Fresnel and absorption folded in.
+fn azimuthal(cos_theta_d: f32, cos_phi: f32, sigma_a: vec3<f32>) -> Lobes {
+    let cos_half_phi = sqrt(clamp(0.5 + 0.5 * cos_phi, 0.0, 1.0));
+
+    // R reflects off the cuticle and keeps the light's color.
+    let n_r = 0.25 * cos_half_phi * fresnel(cos_theta_d * cos_half_phi);
+
+    // TT passes through the fiber and glows when the hair is backlit.
+    let eta = 1.19 / cos_theta_d + 0.36 * cos_theta_d;
+    let a = 1.0 / eta;
+    let h = cos_half_phi * (1.0 + a * (0.6 - 0.8 * cos_phi));
+    let f_tt = fresnel(cos_theta_d * sqrt(clamp(1.0 - h * h, 0.0, 1.0)));
+    // One pass through the fiber is 2 cos γt / cos θt long.
+    let t_tt = exp(-sigma_a * 2.0 * sqrt(clamp(1.0 - h * h * a * a, 0.0, 1.0)) / cos_theta_d);
+    let n_tt = exp(-3.65 * cos_phi - 3.98) * (1.0 - f_tt) * (1.0 - f_tt) * t_tt;
+
+    // TRT is the colored secondary highlight.
+    let f_trt = fresnel(cos_theta_d * 0.5);
+    // Two passes at Karis's average offset.
+    let t_trt = exp(-sigma_a * 3.2 / cos_theta_d);
+    let n_trt = exp(17.0 * cos_phi - 16.78) * (1.0 - f_trt) * (1.0 - f_trt) * f_trt * t_trt;
+
+    return Lobes(vec3<f32>(n_r), n_tt, n_trt);
+}
+
+// Longitudinal shift α and width β of R, TT, and TRT.
+struct Shape {
+    alpha: vec3<f32>,
+    beta: vec3<f32>,
+}
+
+fn lobe_shape(roughness: f32, tilt: f32) -> Shape {
+    let b = clamp(roughness * roughness, 0.02, 1.0);
+    // TT and TRT shift toward the tip.
+    return Shape(vec3<f32>(tilt, -0.5 * tilt, -1.5 * tilt), vec3<f32>(b, 0.5 * b, 2.0 * b));
+}
+
+// Per-pixel dual scattering terms, shared by every light.
+struct DualScatter {
+    // Forward energy of each lobe. Their sum is a_f.
+    fwd: Lobes,
+    a_f: vec3<f32>,
+    alpha_f: vec3<f32>,
+    beta_f2: vec3<f32>,
+    // Local backscattering A_b, its shift Δ_b, and its variance σ_b².
+    a_back: vec3<f32>,
+    delta_b: vec3<f32>,
+    sigma_b2: vec3<f32>,
+}
+
+fn sum_lobes(a: Lobes, b: Lobes) -> Lobes {
+    return Lobes(a.r + b.r, a.tt + b.tt, a.trt + b.trt);
+}
+
+// Energy-weighted mean of a per-lobe quantity.
+fn lobe_mean(l: Lobes, total: vec3<f32>, q: vec3<f32>) -> vec3<f32> {
+    return (l.r * q.x + l.tt * q.y + l.trt * q.z) / max(total, vec3<f32>(1e-5));
+}
+
+// The paper tabulates these over θ. Evaluating at the view's θ needs no table.
+fn dual_scatter(cos_theta_d: f32, sigma_a: vec3<f32>, shape: Shape) -> DualScatter {
+    let zero = vec3<f32>(0.0);
+    var fwd = Lobes(zero, zero, zero);
+    var back = Lobes(zero, zero, zero);
+    for (var i = 0u; i < SCATTER_STEPS; i++) {
+        let u = (f32(i) + 0.5) / f32(SCATTER_STEPS);
+        back = sum_lobes(back, azimuthal(cos_theta_d, cos(u * 0.5 * PI), sigma_a));
+        fwd = sum_lobes(fwd, azimuthal(cos_theta_d, cos((1.0 + u) * 0.5 * PI), sigma_a));
+    }
+    // Midpoint rule over a quarter turn, doubled for the mirrored side.
+    let w = PI / f32(SCATTER_STEPS);
+    fwd = Lobes(fwd.r * w, fwd.tt * w, fwd.trt * w);
+    back = Lobes(back.r * w, back.tt * w, back.trt * w);
+
+    let a_f = min(fwd.r + fwd.tt + fwd.trt, vec3<f32>(0.95));
+    let a_b = back.r + back.tt + back.trt;
+    let beta2 = shape.beta * shape.beta;
+    let alpha_f = lobe_mean(fwd, a_f, shape.alpha);
+    let beta_f2 = lobe_mean(fwd, a_f, beta2);
+    let alpha_b = lobe_mean(back, a_b, shape.alpha);
+    let beta_b2 = lobe_mean(back, a_b, beta2);
+
+    // Eqs. 13–17: one and three backward bounces between forward passes.
+    let af2 = a_f * a_f;
+    let rest = 1.0 - af2;
+    let ab2 = a_b * a_b;
+    let ab3 = ab2 * a_b;
+    let a_back = a_b * af2 / rest + ab3 * af2 / (rest * rest * rest);
+    let delta_b = alpha_b * (1.0 - 2.0 * ab2 / (rest * rest))
+        + alpha_b * (2.0 * rest * rest + 4.0 * af2 * ab2) / (rest * rest * rest);
+    let beta_f = sqrt(beta_f2);
+    let beta_b = sqrt(beta_b2);
+    let sigma_b = (1.0 + DENSITY_BACK * af2)
+        * (a_b * sqrt(2.0 * beta_f2 + beta_b2) + ab3 * sqrt(2.0 * beta_f2 + 3.0 * beta_b2))
+        / max(a_b + ab3 * (2.0 * beta_f + 3.0 * beta_b), vec3<f32>(1e-5));
+
+    return DualScatter(fwd, a_f, alpha_f, beta_f2, a_back, delta_b, sigma_b * sigma_b);
+}
+
+// `depth` is the optical depth of hair toward the light. Zero when unknown.
 fn hair_bsdf(
     tangent: vec3<f32>,
     view: vec3<f32>,
     light: vec3<f32>,
-    fiber_n: vec3<f32>,
-    albedo: vec3<f32>,
-    roughness: f32,
-    tilt: f32,
+    sigma_a: vec3<f32>,
+    shape: Shape,
+    ds: DualScatter,
     shadow: f32,
+    depth: f32,
 ) -> vec3<f32> {
     let t = safe_normalize(tangent);
     let v = safe_normalize(view);
@@ -73,38 +208,34 @@ fn hair_bsdf(
     let t_o = v - t * sin_o;
     let proj = sqrt(max(dot(t_i, t_i) * dot(t_o, t_o), 1e-8));
     let cos_phi = clamp(dot(t_i, t_o) / proj, -1.0, 1.0);
-    let cos_half_phi = sqrt(clamp(0.5 + 0.5 * cos_phi, 0.0, 1.0));
-    let b = clamp(roughness * roughness, 0.02, 1.0);
 
-    // R reflects off the cuticle and keeps the light's color.
-    let m_r = gaussian(b, theta_h - tilt);
-    let n_r = 0.25 * cos_half_phi;
-    let f_r = fresnel(sqrt(clamp(0.5 + 0.5 * dot(v, l), 0.0, 1.0)));
-    var spec = vec3<f32>(m_r * n_r * f_r);
+    let n = azimuthal(cos_theta_d, cos_phi, sigma_a);
+    let m = gaussian3(shape.beta, vec3<f32>(theta_h) - shape.alpha);
+    let single = m.x * n.r + m.y * n.tt + m.z * n.trt;
+    let back = 2.0 * ds.a_back * gaussian3(sqrt(ds.sigma_b2), vec3<f32>(theta_h) - ds.delta_b) / PI;
+    // Fraction of the light that reaches the fiber unscattered.
+    let direct = exp(-depth);
+    var color = direct * (single + DENSITY_BACK * back);
 
-    // TT passes through the fiber and glows when the hair is backlit.
-    let m_tt = gaussian(0.5 * b, theta_h + 0.5 * tilt);
-    let eta = 1.19 / cos_theta_d + 0.36 * cos_theta_d;
-    let a = 1.0 / eta;
-    let h = cos_half_phi * (1.0 + a * (0.6 - 0.8 * cos_phi));
-    let f_tt = fresnel(cos_theta_d * sqrt(clamp(1.0 - h * h, 0.0, 1.0)));
-    let t_tt = pow(albedo, vec3<f32>(0.5 * sqrt(clamp(1.0 - h * h * a * a, 0.0, 1.0)) / cos_theta_d));
-    let n_tt = exp(-3.65 * cos_phi - 3.98);
-    spec += m_tt * n_tt * (1.0 - f_tt) * (1.0 - f_tt) * t_tt;
-
-    // TRT is the colored secondary highlight, shifted toward the tip.
-    let m_trt = gaussian(2.0 * b, theta_h + 1.5 * tilt);
-    let f_trt = fresnel(cos_theta_d * 0.5);
-    let t_trt = pow(albedo, vec3<f32>(0.8 / cos_theta_d));
-    let n_trt = exp(17.0 * cos_phi - 16.78);
-    spec += m_trt * n_trt * (1.0 - f_trt) * (1.0 - f_trt) * f_trt * t_trt;
-
-    // Multiple scattering: wrapped Kajiya-Kay on the view-facing fiber normal.
-    let kajiya = 1.0 - abs(sin_i);
-    let wrapped = clamp((dot(fiber_n, l) + 1.0) * 0.25, 0.0, 1.0);
-    let diffuse = albedo * scatter_tint(albedo, shadow) * (SCATTER / PI) * mix(wrapped, kajiya, 0.33);
-
-    return (spec + diffuse) * shadow;
+    if depth > 1e-3 {
+        // Global forward scattering widens every lobe and spreads it over the
+        // forward half of the azimuth.
+        let sigma_f2 = depth * ds.beta_f2;
+        let transmit = pow(ds.a_f, vec3<f32>(depth));
+        let beta2 = shape.beta * shape.beta;
+        let x = vec3<f32>(theta_h);
+        let spread = gaussian3(sqrt(beta2.x + sigma_f2), x - shape.alpha.x) * ds.fwd.r
+            + gaussian3(sqrt(beta2.y + sigma_f2), x - shape.alpha.y) * ds.fwd.tt
+            + gaussian3(sqrt(beta2.z + sigma_f2), x - shape.alpha.z) * ds.fwd.trt;
+        let back_spread = 2.0 * ds.a_back
+            * gaussian3(sqrt(ds.sigma_b2 + sigma_f2), x - ds.delta_b) / PI;
+        // The paper weights this by T_f minus the direct fraction, which zeroes
+        // any channel with a_f below 1/e. Like Tafuri 2019, "Strand-based Hair
+        // Rendering in Frostbite", weight by the scattered fraction instead.
+        color += (1.0 - direct) * transmit * DENSITY_FRONT
+            * (spread / PI + PI * DENSITY_BACK * back_spread);
+    }
+    return color * shadow;
 }
 
 fn dom_optical_depth(pix: u32, t: f32) -> f32 {
@@ -255,7 +386,8 @@ fn probe_radiance(
     let cos_o = max(cos(theta_o), 1e-3);
     let f_r = fresnel(cos_o);
     let f_trt = fresnel(cos_o * 0.5);
-    let trt = 0.76 * (1.0 - f_trt) * (1.0 - f_trt) * f_trt * pow(albedo, vec3<f32>(0.8 / cos_o));
+    let sigma_a = absorption_from_color(albedo, roughness);
+    let trt = 0.76 * (1.0 - f_trt) * (1.0 - f_trt) * f_trt * exp(-sigma_a * 3.2 / cos_o);
     // The diffuse cubemap is already cosine-weighted irradiance over π.
     let scatter = albedo * scatter_tint(albedo, 0.5);
     return (spec * (f_r + trt) + diff * scatter) * view_bindings::light_probes.intensity_for_view;
@@ -278,6 +410,11 @@ fn direct_light(
     view_z: f32,
     ortho: bool,
 ) -> vec3<f32> {
+    let shape = lobe_shape(roughness, tilt);
+    // θd of the specular cone, where θi = -θo.
+    let cos_theta_o = sqrt(max(1.0 - dot(tangent, view) * dot(tangent, view), 1e-6));
+    let sigma_a = absorption_from_color(albedo, roughness);
+    let ds = dual_scatter(cos_theta_o, sigma_a, shape);
     let world_h = vec4<f32>(world, 1.0);
     let cluster_index = clustering::view_fragment_cluster_index(frag_xy, view_z, ortho);
     let ranges = clustering::unpack_clusterable_object_index_ranges(cluster_index);
@@ -294,7 +431,7 @@ fn direct_light(
         if ((*light).flags & POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u {
             shadow = fetch_point_shadow(light_id, world_h, fiber_n, frag_xy);
         }
-        let lobe = hair_bsdf(tangent, view, incident, fiber_n, albedo, roughness, tilt, shadow);
+        let lobe = hair_bsdf(tangent, view, incident, sigma_a, shape, ds, shadow, 0.0);
         color += lobe * (*light).color_inverse_square_range.rgb * attenuation;
     }
 
@@ -309,7 +446,7 @@ fn direct_light(
         if ((*light).flags & POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u {
             shadow = fetch_spot_shadow(light_id, world_h, fiber_n, (*light).shadow_map_near_z, frag_xy);
         }
-        let lobe = hair_bsdf(tangent, view, incident, fiber_n, albedo, roughness, tilt, shadow);
+        let lobe = hair_bsdf(tangent, view, incident, sigma_a, shape, ds, shadow, 0.0);
         color += lobe * (*light).color_inverse_square_range.rgb * attenuation * spot_mask(light_id, world);
     }
 
@@ -323,11 +460,14 @@ fn direct_light(
         if casts {
             shadow = fetch_directional_shadow(i, world_h, fiber_n, view_z, frag_xy);
         }
+        // Hair in front of the fiber scatters rather than blocks, so the deep
+        // opacity map feeds the BSDF an optical depth instead of a shadow.
+        var depth = 0.0;
         if dom_left && casts {
-            shadow *= dom_visibility(world, beta);
+            depth = -log(max(dom_visibility(world, beta), 1e-6));
             dom_left = false;
         }
-        let lobe = hair_bsdf(tangent, view, incident, fiber_n, albedo, roughness, tilt, shadow);
+        let lobe = hair_bsdf(tangent, view, incident, sigma_a, shape, ds, shadow, depth);
         color += lobe * (*light).color.rgb;
     }
 
@@ -343,7 +483,7 @@ fn direct_light(
         let solid = (*light).width * (*light).height * facing / dist2;
         let range2 = max((*light).range * (*light).range, 1e-4);
         let falloff = getRangeFalloff(dist2, 1.0 / range2);
-        let lobe = hair_bsdf(tangent, view, incident, fiber_n, albedo, roughness, tilt, 1.0);
+        let lobe = hair_bsdf(tangent, view, incident, sigma_a, shape, ds, 1.0, 0.0);
         color += lobe * (*light).color.rgb * solid * falloff;
     }
 #endif
