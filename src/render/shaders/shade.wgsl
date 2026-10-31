@@ -24,51 +24,87 @@ fn vs(@builtin(vertex_index) vertex_index: u32) -> FullscreenVertexOutput {
     return fullscreen_vertex_shader(vertex_index);
 }
 
-fn logistic(x: f32, s: f32) -> f32 {
-    let ss = max(s, 1e-3);
-    let d = exp(-abs(x) / ss);
-    return d / (ss * (1.0 + d) * (1.0 + d));
+// Karis 2016, "Physically Based Hair Shading in Unreal". Longitudinal lobes are
+// Gaussians in θi + θo. Azimuthal TT and TRT use his fitted exponentials, and
+// absorption raises the albedo to the internal path length.
+const SCATTER: f32 = 0.5;
+
+fn gaussian(b: f32, x: f32) -> f32 {
+    return exp(-0.5 * x * x / (b * b)) / (sqrt(2.0 * PI) * b);
 }
 
-fn logistic_cdf(x: f32, s: f32) -> f32 {
-    return 1.0 / (1.0 + exp(-x / max(s, 1e-3)));
+fn fresnel(cos_t: f32) -> f32 {
+    let f0 = pow((1.0 - IOR) / (1.0 + IOR), 2.0);
+    return f0 + (1.0 - f0) * pow(1.0 - clamp(cos_t, 0.0, 1.0), 5.0);
 }
 
-fn trimmed_logistic(x: f32, s: f32) -> f32 {
-    let a = max(logistic_cdf(PI, s) - logistic_cdf(-PI, s), 1e-4);
-    return logistic(x, s) / a;
+fn luminance(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
-fn longitudinal(sin_i: f32, sin_o: f32, shift: f32, roughness: f32) -> f32 {
-    let theta_i = asin(clamp(sin_i, -1.0, 1.0));
-    let theta_o = asin(clamp(sin_o, -1.0, 1.0));
-    return trimmed_logistic(theta_i + theta_o - shift, roughness);
+// Light that reaches the fiber through other hair is tinted by every bounce.
+// The more of the direct light is shadowed, the more saturated the remainder.
+fn scatter_tint(albedo: vec3<f32>, shadow: f32) -> vec3<f32> {
+    // Half strength: dark linear albedos have extreme hue ratios.
+    let hue = albedo / max(luminance(albedo), 1e-4);
+    return pow(hue, vec3<f32>(0.5 - 0.5 * clamp(shadow, 0.0, 1.0)));
 }
 
-fn hair_bsdf(tangent: vec3<f32>, view: vec3<f32>, light: vec3<f32>, albedo: vec3<f32>, roughness: f32, tilt: f32) -> vec3<f32> {
+fn hair_bsdf(
+    tangent: vec3<f32>,
+    view: vec3<f32>,
+    light: vec3<f32>,
+    fiber_n: vec3<f32>,
+    albedo: vec3<f32>,
+    roughness: f32,
+    tilt: f32,
+    shadow: f32,
+) -> vec3<f32> {
     let t = safe_normalize(tangent);
     let v = safe_normalize(view);
     let l = safe_normalize(light);
     let sin_i = clamp(dot(t, l), -1.0, 1.0);
     let sin_o = clamp(dot(t, v), -1.0, 1.0);
-    let cos_i = sqrt(max(1.0 - sin_i * sin_i, 0.0));
-    let t_i = safe_normalize(l - t * sin_i);
-    let t_o = safe_normalize(v - t * sin_o);
-    let phi = acos(clamp(dot(t_i, t_o), -1.0, 1.0));
-    let beta = max(roughness, 0.04);
-    let f0 = pow((1.0 - IOR) / (1.0 + IOR), 2.0);
-    let fres = f0 + (1.0 - f0) * pow(1.0 - cos_i, 5.0);
-    let m_r = longitudinal(sin_i, sin_o, tilt, beta);
-    let m_tt = longitudinal(sin_i, sin_o, -tilt * 0.5, beta * 0.5);
-    let m_trt = longitudinal(sin_i, sin_o, -tilt * 1.5, beta * 2.0);
-    let azimuth_r = 0.25 * cos(phi * 0.5);
-    let n_r = fres * azimuth_r;
-    let n_tt = (1.0 - fres) * albedo * (1.0 / (2.0 * PI));
-    let n_trt = fres * (1.0 - fres) * (1.0 - fres) * albedo * albedo * azimuth_r;
-    let spec = m_r * n_r + m_tt * n_tt + m_trt * n_trt;
-    // Kajiya-Kay diffuse stands in for multiple scattering.
-    let diffuse = albedo * cos_i / PI;
-    return spec * cos_i + diffuse * 0.35;
+    let theta_i = asin(sin_i);
+    let theta_o = asin(sin_o);
+    let theta_h = theta_i + theta_o;
+    let cos_theta_d = max(cos(0.5 * abs(theta_i - theta_o)), 1e-3);
+    let t_i = l - t * sin_i;
+    let t_o = v - t * sin_o;
+    let proj = sqrt(max(dot(t_i, t_i) * dot(t_o, t_o), 1e-8));
+    let cos_phi = clamp(dot(t_i, t_o) / proj, -1.0, 1.0);
+    let cos_half_phi = sqrt(clamp(0.5 + 0.5 * cos_phi, 0.0, 1.0));
+    let b = clamp(roughness * roughness, 0.02, 1.0);
+
+    // R reflects off the cuticle and keeps the light's color.
+    let m_r = gaussian(b, theta_h - tilt);
+    let n_r = 0.25 * cos_half_phi;
+    let f_r = fresnel(sqrt(clamp(0.5 + 0.5 * dot(v, l), 0.0, 1.0)));
+    var spec = vec3<f32>(m_r * n_r * f_r);
+
+    // TT passes through the fiber and glows when the hair is backlit.
+    let m_tt = gaussian(0.5 * b, theta_h + 0.5 * tilt);
+    let eta = 1.19 / cos_theta_d + 0.36 * cos_theta_d;
+    let a = 1.0 / eta;
+    let h = cos_half_phi * (1.0 + a * (0.6 - 0.8 * cos_phi));
+    let f_tt = fresnel(cos_theta_d * sqrt(clamp(1.0 - h * h, 0.0, 1.0)));
+    let t_tt = pow(albedo, vec3<f32>(0.5 * sqrt(clamp(1.0 - h * h * a * a, 0.0, 1.0)) / cos_theta_d));
+    let n_tt = exp(-3.65 * cos_phi - 3.98);
+    spec += m_tt * n_tt * (1.0 - f_tt) * (1.0 - f_tt) * t_tt;
+
+    // TRT is the colored secondary highlight, shifted toward the tip.
+    let m_trt = gaussian(2.0 * b, theta_h + 1.5 * tilt);
+    let f_trt = fresnel(cos_theta_d * 0.5);
+    let t_trt = pow(albedo, vec3<f32>(0.8 / cos_theta_d));
+    let n_trt = exp(17.0 * cos_phi - 16.78);
+    spec += m_trt * n_trt * (1.0 - f_trt) * (1.0 - f_trt) * f_trt * t_trt;
+
+    // Multiple scattering: wrapped Kajiya-Kay on the view-facing fiber normal.
+    let kajiya = 1.0 - abs(sin_i);
+    let wrapped = clamp((dot(fiber_n, l) + 1.0) * 0.25, 0.0, 1.0);
+    let diffuse = albedo * scatter_tint(albedo, shadow) * (SCATTER / PI) * mix(wrapped, kajiya, 0.33);
+
+    return (spec + diffuse) * shadow;
 }
 
 fn dom_optical_depth(pix: u32, t: f32) -> f32 {
@@ -166,12 +202,22 @@ fn cubemap_dir(dir: vec3<f32>) -> vec3<f32> {
     return sample_dir;
 }
 
-fn probe_radiance(fiber_n: vec3<f32>, view: vec3<f32>, roughness: f32) -> vec3<f32> {
+fn probe_radiance(
+    tangent: vec3<f32>,
+    fiber_n: vec3<f32>,
+    view: vec3<f32>,
+    albedo: vec3<f32>,
+    roughness: f32,
+    tilt: f32,
+) -> vec3<f32> {
 #ifdef ENVIRONMENT_MAP
     if view_bindings::light_probes.view_cubemap_index < 0 {
         return vec3<f32>(0.0);
     }
-    let spec_dir = cubemap_dir(reflect(-view, fiber_n));
+    // The R cone sits at θi = tilt - θo. Sample its line facing the camera.
+    let theta_o = asin(clamp(dot(tangent, view), -1.0, 1.0));
+    let theta_i = tilt - theta_o;
+    let spec_dir = cubemap_dir(tangent * sin(theta_i) + fiber_n * cos(theta_i));
     let diff_dir = cubemap_dir(fiber_n);
 #ifdef MULTIPLE_LIGHT_PROBES_IN_ARRAY
     let index = u32(view_bindings::light_probes.view_cubemap_index);
@@ -203,11 +249,19 @@ fn probe_radiance(fiber_n: vec3<f32>, view: vec3<f32>, roughness: f32) -> vec3<f
         0.0,
     ).rgb;
 #endif
-    // One specular lobe stands in for R and TRT. The diffuse cubemap is already irradiance.
-    return (spec + diff) * view_bindings::light_probes.intensity_for_view;
+    // The azimuthal R lobe integrates to one, so R is the Fresnel-weighted
+    // prefiltered radiance. TRT shares the lookup and adds its absorption.
+    // TT from behind is mostly blocked by the head and is left to scattering.
+    let cos_o = max(cos(theta_o), 1e-3);
+    let f_r = fresnel(cos_o);
+    let f_trt = fresnel(cos_o * 0.5);
+    let trt = 0.76 * (1.0 - f_trt) * (1.0 - f_trt) * f_trt * pow(albedo, vec3<f32>(0.8 / cos_o));
+    // The diffuse cubemap is already cosine-weighted irradiance over π.
+    let scatter = albedo * scatter_tint(albedo, 0.5);
+    return (spec * (f_r + trt) + diff * scatter) * view_bindings::light_probes.intensity_for_view;
 #else
     // This specialization has no cubemap bindings. Keep the arguments referenced.
-    return vec3<f32>(dot(fiber_n, view) * roughness * 0.0);
+    return vec3<f32>(dot(fiber_n + tangent, view) * roughness * tilt * albedo.x * 0.0);
 #endif
 }
 
@@ -240,8 +294,8 @@ fn direct_light(
         if ((*light).flags & POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u {
             shadow = fetch_point_shadow(light_id, world_h, fiber_n, frag_xy);
         }
-        let lobe = hair_bsdf(tangent, view, incident, albedo, roughness, tilt);
-        color += lobe * (*light).color_inverse_square_range.rgb * attenuation * shadow;
+        let lobe = hair_bsdf(tangent, view, incident, fiber_n, albedo, roughness, tilt, shadow);
+        color += lobe * (*light).color_inverse_square_range.rgb * attenuation;
     }
 
     for (var i = ranges.first_spot_light_index_offset; i < ranges.first_reflection_probe_index_offset; i++) {
@@ -255,8 +309,8 @@ fn direct_light(
         if ((*light).flags & POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u {
             shadow = fetch_spot_shadow(light_id, world_h, fiber_n, (*light).shadow_map_near_z, frag_xy);
         }
-        let lobe = hair_bsdf(tangent, view, incident, albedo, roughness, tilt);
-        color += lobe * (*light).color_inverse_square_range.rgb * attenuation * spot_mask(light_id, world) * shadow;
+        let lobe = hair_bsdf(tangent, view, incident, fiber_n, albedo, roughness, tilt, shadow);
+        color += lobe * (*light).color_inverse_square_range.rgb * attenuation * spot_mask(light_id, world);
     }
 
     var dom_left = true;
@@ -273,8 +327,8 @@ fn direct_light(
             shadow *= dom_visibility(world, beta);
             dom_left = false;
         }
-        let lobe = hair_bsdf(tangent, view, incident, albedo, roughness, tilt);
-        color += lobe * (*light).color.rgb * shadow;
+        let lobe = hair_bsdf(tangent, view, incident, fiber_n, albedo, roughness, tilt, shadow);
+        color += lobe * (*light).color.rgb;
     }
 
 #ifdef AREA_LIGHT_LUTS
@@ -289,7 +343,7 @@ fn direct_light(
         let solid = (*light).width * (*light).height * facing / dist2;
         let range2 = max((*light).range * (*light).range, 1e-4);
         let falloff = getRangeFalloff(dist2, 1.0 / range2);
-        let lobe = hair_bsdf(tangent, view, incident, albedo, roughness, tilt);
+        let lobe = hair_bsdf(tangent, view, incident, fiber_n, albedo, roughness, tilt, 1.0);
         color += lobe * (*light).color.rgb * solid * falloff;
     }
 #endif
@@ -360,7 +414,7 @@ fn fs(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         view_z,
         ortho,
     );
-    color += probe_radiance(fiber_n, view, roughness) * albedo * ao;
+    color += probe_radiance(tangent, fiber_n, view, albedo, roughness, tilt) * ao;
     // The mesh pipeline scales physical radiance by exposure before the HDR target.
     color *= view_bindings::view.exposure;
 
