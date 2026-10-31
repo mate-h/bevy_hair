@@ -181,7 +181,7 @@ fn setup(
         HairGroom {
             mesh: handles[0].clone(),
             // Roughness picks a prefiltered specular mip. Tilt shifts the primary R highlight.
-            albedo: Color::srgb(0.26, 0.11, 0.05),
+            albedo: Color::srgb(0.32, 0.21, 0.13),
             roughness: 0.45,
             tilt: 0.05,
             ..default()
