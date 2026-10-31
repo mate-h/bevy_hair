@@ -1,14 +1,14 @@
-#import bevy_core_pipeline::fullscreen_vertex_shader::{
-    FullscreenVertexOutput, fullscreen_vertex_shader,
-}
-#import bevy_pbr::clustered_forward as clustering
-#import bevy_pbr::lighting::{getDistanceAttenuation, getRangeFalloff}
-#import bevy_pbr::mesh_view_bindings as view_bindings
-#import bevy_pbr::mesh_view_types::{
-    DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT, POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT,
-    POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE,
-}
-#import bevy_pbr::shadows::{fetch_directional_shadow, fetch_point_shadow, fetch_spot_shadow}
+import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput;
+import bevy_pbr::render::{
+    clustered_forward as clustering,
+    pbr_lighting::{getDistanceAttenuation, getRangeFalloff},
+    mesh_view_bindings as view_bindings,
+    mesh_view_types::{
+        DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT, POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT,
+        POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE,
+    },
+    shadows::{fetch_directional_shadow, fetch_point_shadow, fetch_spot_shadow},
+};
 
 @group(2) @binding(0) var<uniform> params: HairParams;
 @group(2) @binding(1) var<storage, read> center: array<u64>;
@@ -19,9 +19,13 @@
 
 const IOR: f32 = 1.55;
 
+// Bevy's `fullscreen_vertex_shader` is an entry point and can't be called.
+// This is the same oversized triangle.
 @vertex
 fn vs(@builtin(vertex_index) vertex_index: u32) -> FullscreenVertexOutput {
-    return fullscreen_vertex_shader(vertex_index);
+    let uv = vec2<f32>(f32(vertex_index >> 1u), f32(vertex_index & 1u)) * 2.0;
+    let clip_position = vec4<f32>(uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
+    return FullscreenVertexOutput(clip_position, uv);
 }
 
 // Single scattering follows Karis 2016, "Physically Based Hair Shading in
@@ -50,7 +54,8 @@ fn gaussian3(b: vec3<f32>, x: vec3<f32>) -> vec3<f32> {
 }
 
 fn fresnel(cos_t: f32) -> f32 {
-    let f0 = pow((1.0 - IOR) / (1.0 + IOR), 2.0);
+    let r0 = (1.0 - IOR) / (1.0 + IOR);
+    let f0 = r0 * r0;
     return f0 + (1.0 - f0) * pow(1.0 - clamp(cos_t, 0.0, 1.0), 5.0);
 }
 
@@ -333,24 +338,13 @@ fn cubemap_dir(dir: vec3<f32>) -> vec3<f32> {
     return sample_dir;
 }
 
-fn probe_radiance(
-    tangent: vec3<f32>,
-    fiber_n: vec3<f32>,
-    view: vec3<f32>,
-    albedo: vec3<f32>,
-    roughness: f32,
-    tilt: f32,
-) -> vec3<f32> {
-#ifdef ENVIRONMENT_MAP
-    if view_bindings::light_probes.view_cubemap_index < 0 {
-        return vec3<f32>(0.0);
-    }
-    // The R cone sits at θi = tilt - θo. Sample its line facing the camera.
-    let theta_o = asin(clamp(dot(tangent, view), -1.0, 1.0));
-    let theta_i = tilt - theta_o;
-    let spec_dir = cubemap_dir(tangent * sin(theta_i) + fiber_n * cos(theta_i));
-    let diff_dir = cubemap_dir(fiber_n);
-#ifdef MULTIPLE_LIGHT_PROBES_IN_ARRAY
+struct EnvSample {
+    spec: vec3<f32>,
+    diff: vec3<f32>,
+}
+
+@if(ENVIRONMENT_MAP && MULTIPLE_LIGHT_PROBES_IN_ARRAY)
+fn sample_environment(spec_dir: vec3<f32>, diff_dir: vec3<f32>, roughness: f32) -> EnvSample {
     let index = u32(view_bindings::light_probes.view_cubemap_index);
     let last_mip = f32(textureNumLevels(view_bindings::specular_environment_maps[index]) - 1u);
     let spec = textureSampleLevel(
@@ -365,7 +359,11 @@ fn probe_radiance(
         diff_dir,
         0.0,
     ).rgb;
-#else
+    return EnvSample(spec, diff);
+}
+
+@if(ENVIRONMENT_MAP && !MULTIPLE_LIGHT_PROBES_IN_ARRAY)
+fn sample_environment(spec_dir: vec3<f32>, diff_dir: vec3<f32>, roughness: f32) -> EnvSample {
     let last_mip = f32(view_bindings::light_probes.smallest_specular_mip_level_for_view);
     let spec = textureSampleLevel(
         view_bindings::specular_environment_map,
@@ -379,7 +377,42 @@ fn probe_radiance(
         diff_dir,
         0.0,
     ).rgb;
-#endif
+    return EnvSample(spec, diff);
+}
+
+// Without an environment map this specialization has no cubemap bindings.
+@if(!ENVIRONMENT_MAP)
+fn probe_radiance(
+    tangent: vec3<f32>,
+    fiber_n: vec3<f32>,
+    view: vec3<f32>,
+    albedo: vec3<f32>,
+    roughness: f32,
+    tilt: f32,
+) -> vec3<f32> {
+    return vec3<f32>(0.0);
+}
+
+@if(ENVIRONMENT_MAP)
+fn probe_radiance(
+    tangent: vec3<f32>,
+    fiber_n: vec3<f32>,
+    view: vec3<f32>,
+    albedo: vec3<f32>,
+    roughness: f32,
+    tilt: f32,
+) -> vec3<f32> {
+    if view_bindings::light_probes.view_cubemap_index < 0 {
+        return vec3<f32>(0.0);
+    }
+    // The R cone sits at θi = tilt - θo. Sample its line facing the camera.
+    let theta_o = asin(clamp(dot(tangent, view), -1.0, 1.0));
+    let theta_i = tilt - theta_o;
+    let env = sample_environment(
+        cubemap_dir(tangent * sin(theta_i) + fiber_n * cos(theta_i)),
+        cubemap_dir(fiber_n),
+        roughness,
+    );
     // The azimuthal R lobe integrates to one, so R is the Fresnel-weighted
     // prefiltered radiance. TRT shares the lookup and adds its absorption.
     // TT from behind is mostly blocked by the head and is left to scattering.
@@ -390,11 +423,7 @@ fn probe_radiance(
     let trt = 0.76 * (1.0 - f_trt) * (1.0 - f_trt) * f_trt * exp(-sigma_a * 3.2 / cos_o);
     // The diffuse cubemap is already cosine-weighted irradiance over π.
     let scatter = albedo * scatter_tint(albedo, 0.5);
-    return (spec * (f_r + trt) + diff * scatter) * view_bindings::light_probes.intensity_for_view;
-#else
-    // This specialization has no cubemap bindings. Keep the arguments referenced.
-    return vec3<f32>(dot(fiber_n + tangent, view) * roughness * tilt * albedo.x * 0.0);
-#endif
+    return (env.spec * (f_r + trt) + env.diff * scatter) * view_bindings::light_probes.intensity_for_view;
 }
 
 fn direct_light(
@@ -471,7 +500,7 @@ fn direct_light(
         color += lobe * (*light).color.rgb;
     }
 
-#ifdef AREA_LIGHT_LUTS
+@if(AREA_LIGHT_LUTS) {
     let n_rect = view_bindings::lights.n_rect_lights;
     for (var i = 0u; i < n_rect; i++) {
         let light = &view_bindings::lights.rect_lights[i];
@@ -486,7 +515,7 @@ fn direct_light(
         let lobe = hair_bsdf(tangent, view, incident, sigma_a, shape, ds, 1.0, 0.0);
         color += lobe * (*light).color.rgb * solid * falloff;
     }
-#endif
+}
 
     return color;
 }

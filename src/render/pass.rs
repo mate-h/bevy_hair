@@ -6,8 +6,10 @@ use bevy::math::{Mat4, Vec3, Vec4};
 use bevy::pbr::{MeshPipelineViewLayoutKey, MeshViewBindGroup, ViewKeyCache};
 use bevy::prelude::*;
 use bevy::render::render_resource::*;
+use bevy::render::render_asset::RenderAssets;
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery};
-use bevy::render::view::{ViewDepthTexture, ViewTarget};
+use bevy::render::storage::GpuShaderBuffer;
+use bevy::render::view::{ViewDepthStencilTexture, ViewTarget};
 use bytemuck::{Pod, Zeroable};
 
 use crate::mesh::{HairMesh, LAYER_COUNT};
@@ -15,12 +17,27 @@ use crate::render::pipeline::{
     HAIR_PARAMS_SIZE, HairPipelines, HairShadePipeline, queue_composite,
 };
 use crate::render::{ExtractedDirectional, ExtractedFrame, flag};
+use crate::shadow::HairShadow;
 
 pub const DOM_SIZE: u32 = 512;
 /// Opacity slices per light-space texel. Keep in sync with `DOM_LAYERS` in the shaders.
 pub const DOM_LAYERS: u32 = 16;
 /// Beer-Lambert extinction per strand fragment. Visibility is `exp(-hits * DOM_SIGMA)`.
 const DOM_SIGMA: f32 = 0.05;
+/// Front depth texels, then `DOM_LAYERS` opacity counts per texel.
+pub const DOM_BYTES: u64 = (DOM_SIZE * DOM_SIZE * (1 + DOM_LAYERS)) as u64 * 4;
+pub const SHADOW_LIGHT_BYTES: u64 = size_of::<ShadowLight>() as u64;
+
+/// The deep opacity map's light view for `hair_shadow.wesl`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ShadowLight {
+    light_clip_from_world: [[f32; 4]; 4],
+    light_eye: [f32; 4],
+    light_forward: [f32; 4],
+    // x near, y far, z extinction, w 1 once a map exists.
+    depth: [f32; 4],
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -165,6 +182,8 @@ fn init_buffer<T: Pod>(device: &RenderDevice, label: &str, data: &[T]) -> Buffer
 
 enum BufferKind {
     Storage,
+    /// Storage that is also copied out, like the deep opacity map.
+    SharedStorage,
     Indirect,
     Uniform,
 }
@@ -173,6 +192,7 @@ fn zeros(device: &RenderDevice, label: &str, size: u64, kind: BufferKind) -> Buf
     let mut usage = BufferUsages::COPY_DST;
     match kind {
         BufferKind::Storage => usage |= BufferUsages::STORAGE,
+        BufferKind::SharedStorage => usage |= BufferUsages::STORAGE | BufferUsages::COPY_SRC,
         BufferKind::Indirect => usage |= BufferUsages::STORAGE | BufferUsages::INDIRECT,
         BufferKind::Uniform => usage |= BufferUsages::UNIFORM,
     }
@@ -189,6 +209,9 @@ pub struct FrameGpu {
     pub targets: Option<ScreenTargets>,
     pub dummy_depth: Option<TextureView>,
     shade_target: Option<ShadeTarget>,
+    /// Staging for `HairShadow::light`. Copied in command order so receivers
+    /// read the light view that matches the copied map.
+    shadow_light: Option<Buffer>,
 }
 
 struct ShadeTarget {
@@ -229,13 +252,15 @@ pub(crate) struct HairPass<'w> {
     device: Res<'w, RenderDevice>,
     extracted: Res<'w, ExtractedFrame>,
     view_keys: Res<'w, ViewKeyCache>,
+    shadow: Option<Res<'w, HairShadow>>,
+    shader_buffers: Res<'w, RenderAssets<GpuShaderBuffer>>,
 }
 
 pub fn hair_pass(
     view: ViewQuery<(
         &bevy::render::view::ExtractedView,
         &ViewTarget,
-        &ViewDepthTexture,
+        &ViewDepthStencilTexture,
         &MeshViewBindGroup,
     )>,
     mut ctx: RenderContext,
@@ -251,7 +276,16 @@ pub fn hair_pass(
         device,
         extracted,
         view_keys,
+        shadow,
+        shader_buffers,
     } = hair;
+    // Materials that receive hair shadows read these between hair passes.
+    let shadow_dom = shadow
+        .as_ref()
+        .and_then(|shadow| shader_buffers.get(&shadow.dom));
+    let shadow_light_dst = shadow
+        .as_ref()
+        .and_then(|shadow| shader_buffers.get(&shadow.light));
     let (view, target, depth, mesh_view) = view.into_inner();
     let Some(mesh_key) = view_keys.get(&view.retained_view_entity) else {
         return;
@@ -289,6 +323,19 @@ pub fn hair_pass(
     ensure_targets(&device, &mut state.frame, width, height);
     ensure_shade_target(&device, &mut state.frame, width, height);
     ensure_dummy_depth(&device, &mut ctx, &mut state.frame);
+    let shadow_light_src = state
+        .frame
+        .shadow_light
+        .get_or_insert_with(|| {
+            device.create_buffer(&BufferDescriptor {
+                label: Some("hair_shadow_light"),
+                size: SHADOW_LIGHT_BYTES,
+                usage: BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        })
+        .clone();
+    let mut shadow_light = ShadowLight::zeroed();
     let shade_view = state.frame.shade_target.as_ref().unwrap().view.clone();
     let environment_map = layout_key.contains(MeshPipelineViewLayoutKey::ENVIRONMENT_MAP);
 
@@ -301,7 +348,7 @@ pub fn hair_pass(
     let world_from_clip = clip_from_world.inverse();
     let reverse = depth_is_reverse(clip_from_world, camera_pos, forward);
 
-    let depth_format = depth.texture.format();
+    let depth_format = depth.texture().format();
     let color_format = target.main_texture_format();
     let composite_id = ensure_composite(
         &cache,
@@ -315,15 +362,12 @@ pub fn hair_pass(
         return;
     };
 
-    let depth_view = if depth
-        .texture
-        .usage()
-        .contains(TextureUsages::TEXTURE_BINDING)
-    {
-        depth.view()
-    } else {
-        state.frame.dummy_depth.as_ref().unwrap()
-    };
+    let depth_view = depth
+        .attachment
+        .depth_stencil_views()
+        .depth_only_view()
+        .filter(|_| depth.texture().usage().contains(TextureUsages::TEXTURE_BINDING))
+        .unwrap_or_else(|| state.frame.dummy_depth.as_ref().unwrap());
 
     let targets = state.frame.targets.as_ref().unwrap();
     let pixels = width * height;
@@ -524,6 +568,16 @@ pub fn hair_pass(
                     indirect: &gpu.dom_indirect,
                 },
             );
+            if let Some(dst) = shadow_dom {
+                ctx.command_encoder()
+                    .copy_buffer_to_buffer(&targets.dom, 0, &dst.buffer, 0, DOM_BYTES);
+                shadow_light = ShadowLight {
+                    light_clip_from_world: light_clip.to_cols_array_2d(),
+                    light_eye: light_eye.extend(1.0).to_array(),
+                    light_forward: light_dir.extend(0.0).to_array(),
+                    depth: [light_near, light_far, DOM_SIGMA, 1.0],
+                };
+            }
         }
 
         draw_shade(
@@ -586,6 +640,19 @@ pub fn hair_pass(
         pass.set_render_pipeline(composite);
         pass.set_bind_group(0, &group, &[]);
         pass.draw(0..3, 0..1);
+    }
+
+    // The queue write lands before this frame's commands, so the copy below
+    // publishes it alongside the map copied above.
+    if let Some(dst) = shadow_light_dst {
+        queue.write_buffer(&shadow_light_src, 0, bytemuck::bytes_of(&shadow_light));
+        ctx.command_encoder().copy_buffer_to_buffer(
+            &shadow_light_src,
+            0,
+            &dst.buffer,
+            0,
+            SHADOW_LIGHT_BYTES,
+        );
     }
 }
 
@@ -700,8 +767,11 @@ fn light_fit(
     } else {
         Vec3::Y
     };
-    let view = Mat4::look_at_rh(eye, eye + forward, up);
-    let proj = Mat4::orthographic_rh(-radius, radius, -radius, radius, near, far);
+    let view = Transform::from_translation(eye)
+        .looking_to(forward, up)
+        .to_matrix()
+        .inverse();
+    let proj = bevy::math::proj::orthographic(-radius, radius, -radius, radius, near, far);
     (eye, forward, proj * view, near, far)
 }
 
@@ -738,8 +808,8 @@ fn ensure_targets(device: &RenderDevice, frame: &mut FrameGpu, width: u32, heigh
         dom: zeros(
             device,
             "hair_dom",
-            DOM_SIZE as u64 * DOM_SIZE as u64 * (1 + DOM_LAYERS as u64) * 4,
-            BufferKind::Storage,
+            DOM_BYTES,
+            BufferKind::SharedStorage,
         ),
     });
 }
@@ -1008,5 +1078,14 @@ mod dom_layout {
             "{layers} missing from clear_dom.wgsl"
         );
         assert!(clear.contains(&size), "{size} missing from clear_dom.wgsl");
+        let receiver = include_str!("shaders/hair_shadow.wesl");
+        assert!(
+            receiver.contains(&layers),
+            "{layers} missing from hair_shadow.wesl"
+        );
+        assert!(
+            receiver.contains(&size),
+            "{size} missing from hair_shadow.wesl"
+        );
     }
 }

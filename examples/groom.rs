@@ -28,7 +28,9 @@ use bevy::render::settings::WgpuSettings;
 use bevy_camera_controller::free_camera::{
     FreeCamera, FreeCameraPlugin, run_freecamera_controller,
 };
-use bevy_hair::{HairGroom, HairMesh, HairPlugin, LAYER_COUNT, Scalp};
+use bevy_hair::{
+    HairGroom, HairMesh, HairPlugin, HairShadow, HairShadowMaterial, LAYER_COUNT, Scalp,
+};
 
 fn main() {
     let mut wgpu = WgpuSettings::default();
@@ -184,7 +186,8 @@ fn setup(
     mut commands: Commands,
     mut prepared: ResMut<Prepared>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<HairShadowMaterial>>,
+    hair_shadow: Res<HairShadow>,
     mut hair: ResMut<Assets<HairMesh>>,
     asset_server: Res<AssetServer>,
 ) {
@@ -206,12 +209,16 @@ fn setup(
     let focus = Vec3::new(-5.0, 15.0, 0.0);
     commands.spawn((
         Mesh3d(meshes.add(head)),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.73, 0.52, 0.44),
-            perceptual_roughness: 0.45,
-            metallic: 0.0,
-            specular_tint: Color::srgb(1.0, 0.74, 0.62),
-            ..default()
+        // The hair shadows the head through the key light's deep opacity map.
+        MeshMaterial3d(materials.add(HairShadowMaterial {
+            base: StandardMaterial {
+                base_color: Color::srgb(0.73, 0.52, 0.44),
+                perceptual_roughness: 0.45,
+                metallic: 0.0,
+                specular_tint: Color::srgb(1.0, 0.74, 0.62),
+                ..default()
+            },
+            extension: hair_shadow.receiver(),
         })),
         model,
     ));

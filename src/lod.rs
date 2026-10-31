@@ -43,7 +43,7 @@ pub fn depth_correction(beta: f32) -> f32 {
 /// `t` is the depth past the texel’s front surface, in layers. Completed layers
 /// count fully. The layer that contains the point counts only the fraction in
 /// front of it. Hair at the same depth or behind the point does not count.
-/// `dom_optical_depth` in `shade.wgsl` follows this.
+/// `dom_optical_depth` in `shade.wesl` follows this.
 pub fn dom_optical_depth(layers: &[u32], t: f32) -> f32 {
     let mut occ = 0.0;
     for (slice, count) in layers.iter().copied().enumerate() {

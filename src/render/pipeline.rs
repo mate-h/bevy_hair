@@ -55,7 +55,7 @@ pub fn load_shaders(shaders: &mut Assets<Shader>) -> HairShaderHandles {
             include_str!("shaders/raster.wgsl"),
             true,
         ),
-        shade: shaders.add(Shader::from_wgsl(shade_source(), "hair_shade.wgsl")),
+        shade: shaders.add(Shader::from_wesl(shade_source(), "hair_shade.wesl")),
         filter: shader(
             shaders,
             "hair_filter.wgsl",
@@ -245,6 +245,7 @@ impl SpecializedRenderPipeline for HairShadePipeline {
                 shader_defs: shader_defs.clone(),
                 entry_point: Some("vs".into()),
                 buffers: Vec::new(),
+                ..default()
             },
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),
@@ -255,6 +256,7 @@ impl SpecializedRenderPipeline for HairShadePipeline {
                     blend: None,
                     write_mask: ColorWrites::ALL,
                 })],
+                ..default()
             }),
             primitive: PrimitiveState::default(),
             depth_stencil: None,
@@ -278,11 +280,11 @@ fn params_uniform() -> bevy::render::render_resource::BindGroupLayoutEntryBuilde
 }
 
 fn shade_source() -> String {
-    let body = include_str!("shaders/shade.wgsl");
+    let body = include_str!("shaders/shade.wesl");
     let (imports, rest) = body
         .split_once("@group")
-        .expect("shade.wgsl bindings follow the imports");
-    // `HairParams` has to exist before the bindings, and the `#import` block has to stay first.
+        .expect("shade.wesl bindings follow the imports");
+    // `HairParams` has to exist before the bindings, and the imports have to stay first.
     format!("{imports}\n{COMMON}\n@group{rest}")
 }
 
@@ -310,6 +312,7 @@ pub fn queue_composite(
             entry_point: Some("vs".into()),
             shader_defs: Vec::new(),
             buffers: Vec::new(),
+            ..default()
         },
         fragment: Some(FragmentState {
             shader,
@@ -320,6 +323,7 @@ pub fn queue_composite(
                 blend: Some(BlendState::ALPHA_BLENDING),
                 write_mask: ColorWrites::ALL,
             })],
+            ..default()
         }),
         primitive: PrimitiveState::default(),
         depth_stencil: Some(DepthStencilState {

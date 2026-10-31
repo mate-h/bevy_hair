@@ -7,14 +7,17 @@ use bevy::asset::AssetId;
 use bevy::camera::visibility::Visibility;
 use bevy::core_pipeline::core_3d::{main_opaque_pass_3d, main_transparent_pass_3d};
 use bevy::core_pipeline::{Core3d, Core3dSystems};
+use bevy::asset::{RenderAssetUsages, embedded_asset};
 use bevy::ecs::system::ResMut;
 use bevy::math::{Mat4, Vec3, Vec4};
 use bevy::pbr::MeshPipelineSystems;
 use bevy::prelude::*;
+use bevy::render::storage::ShaderBuffer;
 use bevy::render::{Extract, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems};
 
 use crate::HairGroom;
 use crate::mesh::HairMesh;
+use crate::shadow::{HairShadow, HairShadowMaterial};
 
 use pass::{GpuGroom, HairPassState};
 
@@ -23,6 +26,8 @@ pub struct HairPlugin;
 impl Plugin for HairPlugin {
     fn build(&self, app: &mut App) {
         app.init_asset::<HairMesh>();
+        embedded_asset!(app, "shaders/hair_shadow.wesl");
+        app.add_plugins(MaterialPlugin::<HairShadowMaterial>::default());
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -46,6 +51,22 @@ impl Plugin for HairPlugin {
     }
 
     fn finish(&self, app: &mut App) {
+        if let Some(mut buffers) = app.world_mut().get_resource_mut::<Assets<ShaderBuffer>>() {
+            let shadow = HairShadow {
+                dom: buffers.add(ShaderBuffer::with_size(
+                    pass::DOM_BYTES,
+                    RenderAssetUsages::RENDER_WORLD,
+                )),
+                light: buffers.add(ShaderBuffer::with_size(
+                    pass::SHADOW_LIGHT_BYTES,
+                    RenderAssetUsages::RENDER_WORLD,
+                )),
+            };
+            app.insert_resource(shadow.clone());
+            if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+                render_app.insert_resource(shadow);
+            }
+        }
         let Some(handles) = app
             .world_mut()
             .get_resource_mut::<Assets<Shader>>()

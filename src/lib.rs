@@ -16,6 +16,7 @@ mod lod;
 mod mesh;
 mod obj;
 mod render;
+mod shadow;
 
 use bevy::prelude::*;
 
@@ -24,6 +25,7 @@ pub use hair_file::{HairError, HairStrands, load_hair_path, parse_hair};
 pub use mesh::{BundleDesc, CageCorner, HairMesh, LAYER_COUNT};
 pub use obj::load_obj_path;
 pub use render::HairPlugin;
+pub use shadow::{HairShadow, HairShadowMaterial, HairShadowReceiver};
 
 /// A groom instance. The mesh is a baked hair mesh; shading parameters are uniform
 /// across the groom and varied along each strand by the stored `uvw` coordinate.
