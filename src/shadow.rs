@@ -6,12 +6,24 @@ use bevy::render::render_resource::AsBindGroup;
 use bevy::render::storage::ShaderBuffer;
 use bevy::shader::ShaderRef;
 
-/// A [`StandardMaterial`] that hair shadows. [`crate::HairPlugin`] renders a
-/// deep opacity map from every directional, point, and spot light with a
-/// [`CustomShadowChannel`](bevy::light::CustomShadowChannel), and the material
-/// attenuates each light by the strands between the surface and that light.
-/// Give each light its own channel. Build the extension with
-/// [`HairShadow::receiver`].
+/// The most lights that can carry [`HairShadowCaster`]. Extra ones are ignored.
+pub const MAX_HAIR_SHADOW_CASTERS: usize = 4;
+
+/// Marks a directional, point, or spot light whose light hair blocks on
+/// [`HairShadowMaterial`] surfaces. [`crate::HairPlugin`] renders a deep opacity
+/// map from each one.
+#[derive(Component, Reflect, Clone, Copy, Debug, Default)]
+#[reflect(Component, Default)]
+pub struct HairShadowCaster;
+
+/// A [`StandardMaterial`] that hair shadows. Each [`HairShadowCaster`] light is
+/// attenuated by the strands between the surface and that light. Build the
+/// extension with [`HairShadow::receiver`].
+///
+/// Bevy 0.20 has no per-light shadow hook, so the shader runs Bevy's lighting,
+/// then removes the occluded share of each caster's direct light. That share
+/// is evaluated for the base layer, without clearcoat, anisotropy, or
+/// transmission.
 ///
 /// The map is the one the previous frame rendered, so a moving light or groom
 /// lags its shadow by a frame.
@@ -33,7 +45,7 @@ impl MaterialExtension for HairShadowReceiver {
 }
 
 /// The deep opacity maps [`crate::HairPlugin`] publishes for materials, one per
-/// custom shadow channel. With several grooms, the last one drawn casts.
+/// [`HairShadowCaster`]. With several grooms, the last one drawn casts.
 #[derive(Resource, Clone)]
 pub struct HairShadow {
     pub(crate) dom: Handle<ShaderBuffer>,

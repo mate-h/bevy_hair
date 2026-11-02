@@ -18,7 +18,7 @@ use std::fmt;
 
 use bevy::app::{PluginGroup, RunFixedMainLoop, RunFixedMainLoopSystems};
 use bevy::camera::Hdr;
-use bevy::light::{CascadeShadowConfigBuilder, CustomShadowChannel};
+use bevy::light::CascadeShadowConfigBuilder;
 use bevy::log::LogPlugin;
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
@@ -29,7 +29,8 @@ use bevy_camera_controller::free_camera::{
     FreeCamera, FreeCameraPlugin, run_freecamera_controller,
 };
 use bevy_hair::{
-    HairGroom, HairMesh, HairPlugin, HairShadow, HairShadowMaterial, LAYER_COUNT, Scalp,
+    HairGroom, HairMesh, HairPlugin, HairShadow, HairShadowCaster, HairShadowMaterial, LAYER_COUNT,
+    Scalp,
 };
 
 fn main() {
@@ -309,7 +310,7 @@ fn setup(
         }
         .build(),
         Transform::from_translation(key).looking_at(focus, Vec3::Y),
-        CustomShadowChannel(0),
+        HairShadowCaster,
     ));
 
     // Studio directions in the opening camera's frame. `right` is screen right.
@@ -330,7 +331,7 @@ fn setup(
             ..default()
         },
         Transform::from_translation(focus + fill * STUDIO_DISTANCE),
-        CustomShadowChannel(1),
+        HairShadowCaster,
         StudioLight,
     ));
     // Rim from behind and above. Its shadow map lets the head block it from
@@ -347,7 +348,7 @@ fn setup(
             ..default()
         },
         Transform::from_translation(focus + rim * STUDIO_DISTANCE).looking_at(focus, Vec3::Y),
-        CustomShadowChannel(2),
+        HairShadowCaster,
         StudioLight,
     ));
 }

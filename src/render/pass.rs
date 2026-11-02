@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use bevy::asset::AssetId;
 use bevy::ecs::system::SystemParam;
-use bevy::light::MAX_CUSTOM_SHADOW_CHANNELS;
 use bevy::math::{Mat4, Vec2, Vec3, Vec4};
 use bevy::pbr::{MeshPipelineViewLayoutKey, MeshViewBindGroup, ViewKeyCache};
 use bevy::prelude::*;
@@ -18,7 +17,7 @@ use crate::render::pipeline::{
     HAIR_PARAMS_SIZE, HairPipelines, HairShadePipeline, queue_composite,
 };
 use crate::render::{ExtractedDirectional, ExtractedFrame, ExtractedGroom, flag};
-use crate::shadow::HairShadow;
+use crate::shadow::{HairShadow, MAX_HAIR_SHADOW_CASTERS};
 
 pub const DOM_SIZE: u32 = 512;
 /// Opacity slices per light-space texel. Keep in sync with `DOM_LAYERS` in the shaders.
@@ -29,12 +28,12 @@ const DOM_SIGMA: f32 = 0.05;
 pub const DOM_BYTES: u64 = (DOM_SIZE * DOM_SIZE * (1 + DOM_LAYERS)) as u64 * 4;
 pub const SHADOW_LIGHT_BYTES: u64 = size_of::<ShadowLight>() as u64;
 
-pub const SHADOW_CHANNELS: usize = MAX_CUSTOM_SHADOW_CHANNELS as usize;
-/// One deep opacity map per custom shadow channel, plus the key light's when
-/// it has no channel.
+/// Shadow slots, one per `HairShadowCaster`.
+pub const SHADOW_CHANNELS: usize = MAX_HAIR_SHADOW_CASTERS;
+/// One deep opacity map per caster, plus the key light's when it is not one.
 const DOM_VIEWS: usize = SHADOW_CHANNELS + 1;
 
-/// A deep opacity map's light view for `hair_shadow.wesl`, one per channel.
+/// A deep opacity map's light view for `hair_shadow.wesl`, one per caster slot.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Pod, Zeroable)]
 struct ShadowLight {
@@ -43,6 +42,9 @@ struct ShadowLight {
     light_forward: [f32; 4],
     // x near, y far, z extinction, w 1 once a map exists.
     depth: [f32; 4],
+    // Identifies the Bevy light: xyz direction to a directional light (w 1)
+    // or a point or spot light's position (w 2).
+    source: [f32; 4],
 }
 
 #[repr(C)]
@@ -554,6 +556,11 @@ pub fn hair_pass(
                         light_eye: fit.eye.extend(1.0).to_array(),
                         light_forward: fit.forward.extend(0.0).to_array(),
                         depth: [fit.near, fit.far, DOM_SIGMA, 1.0],
+                        source: match view.source {
+                            LightSource::Directional(to_light) => to_light.extend(1.0),
+                            LightSource::Positional(position) => position.extend(2.0),
+                        }
+                        .to_array(),
                     };
                 }
             }

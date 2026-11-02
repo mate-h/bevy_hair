@@ -9,7 +9,6 @@ use bevy::camera::visibility::Visibility;
 use bevy::core_pipeline::core_3d::{main_opaque_pass_3d, main_transparent_pass_3d};
 use bevy::core_pipeline::{Core3d, Core3dSystems};
 use bevy::ecs::system::ResMut;
-use bevy::light::{CustomShadowChannel, MAX_CUSTOM_SHADOW_CHANNELS};
 use bevy::math::{Mat4, Vec3, Vec4};
 use bevy::pbr::MeshPipelineSystems;
 use bevy::prelude::*;
@@ -18,7 +17,7 @@ use bevy::render::{Extract, ExtractSchedule, Render, RenderApp, RenderStartup, R
 
 use crate::HairGroom;
 use crate::mesh::HairMesh;
-use crate::shadow::{HairShadow, HairShadowMaterial};
+use crate::shadow::{HairShadow, HairShadowCaster, HairShadowMaterial, MAX_HAIR_SHADOW_CASTERS};
 
 use pass::{GpuGroom, HairPassState};
 
@@ -85,7 +84,7 @@ impl Plugin for HairPlugin {
 pub(crate) struct ExtractedFrame {
     pub grooms: Vec<ExtractedGroom>,
     pub directionals: Vec<ExtractedDirectional>,
-    /// Point and spot lights on a custom shadow channel.
+    /// Point and spot lights that are hair shadow casters.
     pub positionals: Vec<ExtractedPositional>,
     meshes: HashMap<AssetId<HairMesh>, HairMesh>,
 }
@@ -118,21 +117,25 @@ pub(crate) struct ExtractedPositional {
 type DirectionalCaster = (
     &'static DirectionalLight,
     &'static GlobalTransform,
-    Option<&'static CustomShadowChannel>,
+    Has<HairShadowCaster>,
 );
 
-type PositionalCaster = (
-    &'static GlobalTransform,
-    &'static CustomShadowChannel,
-    &'static InheritedVisibility,
+type PositionalCaster = (&'static GlobalTransform, &'static InheritedVisibility);
+
+type PositionalLight = (
+    With<HairShadowCaster>,
+    Or<(With<PointLight>, With<SpotLight>)>,
 );
 
-type PositionalLight = Or<(With<PointLight>, With<SpotLight>)>;
+/// Hands out shadow slots to casters in query order.
+struct Slots(usize);
 
-fn valid_channel(channel: Option<&CustomShadowChannel>) -> Option<u8> {
-    channel
-        .map(|channel| channel.0)
-        .filter(|&channel| channel < MAX_CUSTOM_SHADOW_CHANNELS)
+impl Slots {
+    fn next(&mut self) -> Option<u8> {
+        let slot = (self.0 < MAX_HAIR_SHADOW_CASTERS).then_some(self.0 as u8);
+        self.0 += 1;
+        slot
+    }
 }
 
 fn extract_hair(
@@ -169,15 +172,19 @@ fn extract_hair(
             center_diameter: groom.center_diameter,
         });
     }
-    for (light, transform, channel) in &lights {
+    let mut slots = Slots(0);
+    for (light, transform, caster) in &lights {
         extracted.directionals.push(ExtractedDirectional {
             direction_to_light: transform.back().as_vec3(),
             casts_shadows: light.shadow_maps_enabled,
-            channel: valid_channel(channel),
+            channel: if caster { slots.next() } else { None },
         });
     }
-    for (transform, channel, visibility) in &positionals {
-        let Some(channel) = valid_channel(Some(channel)).filter(|_| visibility.get()) else {
+    for (transform, visibility) in &positionals {
+        if !visibility.get() {
+            continue;
+        }
+        let Some(channel) = slots.next() else {
             continue;
         };
         extracted.positionals.push(ExtractedPositional {
