@@ -545,7 +545,7 @@ fn fs(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     if params.flags.z == 0u {
         ao = 1.0;
     }
-    let beta = f32(beta_buf[pix] & 0xffu) / 255.0;
+    let beta = f32(~beta_buf[pix] & 0xffu) / 255.0;
     let roughness = max(params.appearance.x * (0.65 + 0.7 * uvw.z), 0.04);
     let tilt = params.appearance.y;
     let albedo = params.albedo.xyz * (0.65 + 0.35 * uvw.z);

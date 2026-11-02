@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use bevy::asset::AssetId;
 use bevy::ecs::system::SystemParam;
 use bevy::light::MAX_CUSTOM_SHADOW_CHANNELS;
-use bevy::math::{Mat4, Vec3, Vec4};
+use bevy::math::{Mat4, Vec2, Vec3, Vec4};
 use bevy::pbr::{MeshPipelineViewLayoutKey, MeshViewBindGroup, ViewKeyCache};
 use bevy::prelude::*;
 use bevy::render::render_asset::RenderAssets;
@@ -36,7 +36,7 @@ const DOM_VIEWS: usize = SHADOW_CHANNELS + 1;
 
 /// A deep opacity map's light view for `hair_shadow.wesl`, one per channel.
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
 struct ShadowLight {
     light_clip_from_world: [[f32; 4]; 4],
     light_eye: [f32; 4],
@@ -63,6 +63,7 @@ struct HairParams {
     light_eye: [f32; 4],
     light_forward: [f32; 4],
     dom_info: [f32; 4],
+    rect: [u32; 4],
 }
 
 const _: () = assert!(std::mem::size_of::<HairParams>() == HAIR_PARAMS_SIZE as usize);
@@ -230,6 +231,12 @@ pub struct FrameGpu {
     /// Staging for `HairShadow::light`. Copied in command order so receivers
     /// read the light view that matches the copied map.
     shadow_light: Option<Buffer>,
+    /// The light views and groom placement the deep opacity maps were last
+    /// rendered for. While they hold, the maps are reused.
+    dom_signature: Option<Vec<f32>>,
+    /// The screen rectangle the last groom wrote, as `[x0, y0, x1, y1)`.
+    written_rect: Option<[u32; 4]>,
+    shadow_lights: [ShadowLight; SHADOW_CHANNELS],
 }
 
 struct ShadeTarget {
@@ -313,9 +320,6 @@ pub fn hair_pass(
     let Some(shade) = cache.get_render_pipeline(shade_id) else {
         return;
     };
-    let Some(clear) = cache.get_compute_pipeline(pipelines.clear) else {
-        return;
-    };
     let Some(clear_dom) = cache.get_compute_pipeline(pipelines.clear_dom) else {
         return;
     };
@@ -353,8 +357,14 @@ pub fn hair_pass(
             })
         })
         .clone();
-    let mut shadow_lights = [ShadowLight::zeroed(); SHADOW_CHANNELS];
     let views = light_views(&extracted);
+    let dom_signature = shadow_dom.and(dom_signature(&extracted, &state.grooms, &views));
+    let reuse_doms = dom_signature.is_some() && dom_signature == state.frame.dom_signature;
+    let mut shadow_lights = if reuse_doms {
+        state.frame.shadow_lights
+    } else {
+        [ShadowLight::zeroed(); SHADOW_CHANNELS]
+    };
     let shade_view = state.frame.shade_target.as_ref().unwrap().view.clone();
     let environment_map = layout_key.contains(MeshPipelineViewLayoutKey::ENVIRONMENT_MAP);
 
@@ -394,31 +404,32 @@ pub fn hair_pass(
         .unwrap_or_else(|| state.frame.dummy_depth.as_ref().unwrap());
 
     let targets = state.frame.targets.as_ref().unwrap();
-    let pixels = width * height;
+    let mut written = state.frame.written_rect;
 
     for groom in &extracted.grooms {
         let Some(gpu) = state.grooms.get(&groom.asset) else {
             continue;
         };
-        {
-            let group = ctx.render_device().create_bind_group(
-                None,
-                &cache.get_bind_group_layout(&pipelines.clear_layout),
-                &BindGroupEntries::sequential((
-                    targets.center.as_entire_binding(),
-                    targets.conservative.as_entire_binding(),
-                    targets.beta.as_entire_binding(),
-                )),
+        // Every per-pixel pass covers only the groom's screen rectangle. The
+        // G-buffer is cleared over the rows of that rectangle and of the last
+        // one written, so everything outside stays empty.
+        let rect = screen_rect(gpu, groom.world_from_model, clip_from_world, width, height);
+        let rows = written.map_or([rect[1], rect[3]], |last| {
+            [rect[1].min(last[1]), rect[3].max(last[3])]
+        });
+        written = Some(rect);
+        for (buffer, texel) in [
+            (&targets.center, 8),
+            (&targets.conservative, 8),
+            (&targets.beta, 4),
+        ] {
+            let row = u64::from(width) * texel;
+            // Empty is zero in all three (see `unpack_gb`), so a blit fill clears them.
+            ctx.command_encoder().clear_buffer(
+                buffer,
+                u64::from(rows[0]) * row,
+                Some(u64::from(rows[1] - rows[0]) * row),
             );
-            let mut pass = ctx
-                .command_encoder()
-                .begin_compute_pass(&ComputePassDescriptor {
-                    label: Some("hair_clear"),
-                    ..default()
-                });
-            pass.set_pipeline(clear);
-            pass.set_bind_group(0, &group, &[]);
-            pass.dispatch_workgroups(pixels.div_ceil(256), 1, 1);
         }
         let key = views.last().expect("the key view is always present");
         let Some(LightFit {
@@ -455,6 +466,7 @@ pub fn hair_pass(
             dom_scale,
             pass_mode: [0, gpu.bundle_count, u32::from(reverse), 0],
             light_eye,
+            rect,
         });
         queue.write_buffer(&gpu.camera_params, 0, bytemuck::bytes_of(&camera_params));
 
@@ -500,7 +512,7 @@ pub fn hair_pass(
             },
         );
 
-        if groom.deep_opacity {
+        if groom.deep_opacity && !reuse_doms {
             let dom = DomPasses {
                 clear_dom,
                 lod,
@@ -556,6 +568,7 @@ pub fn hair_pass(
                 mesh_view,
                 environment_map,
                 shade_view: &shade_view,
+                rect,
                 buffers: ShadeBuffers {
                     params: &gpu.camera_params,
                     targets,
@@ -578,7 +591,11 @@ pub fn hair_pass(
                     targets.filtered.as_entire_binding(),
                     targets.filtered_depth.as_entire_binding(),
                 )),
-                (width.div_ceil(8), height.div_ceil(4), 1),
+                (
+                    (rect[2] - rect[0]).div_ceil(16),
+                    (rect[3] - rect[1]).div_ceil(8),
+                    1,
+                ),
             );
             (&targets.filtered, &targets.filtered_depth)
         } else {
@@ -605,9 +622,14 @@ pub fn hair_pass(
             multiview_mask: None,
         });
         pass.set_render_pipeline(composite);
+        pass.set_scissor_rect(rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1]);
         pass.set_bind_group(0, &group, &[]);
         pass.draw(0..3, 0..1);
     }
+
+    state.frame.written_rect = written;
+    state.frame.dom_signature = dom_signature;
+    state.frame.shadow_lights = shadow_lights;
 
     // The queue write lands before this frame's commands, so the copy below
     // publishes it alongside the map copied above.
@@ -638,6 +660,7 @@ struct ViewArgs<'a> {
     dom_scale: f32,
     pass_mode: [u32; 4],
     light_eye: Vec3,
+    rect: [u32; 4],
 }
 
 fn make_params(args: ViewArgs) -> HairParams {
@@ -672,6 +695,7 @@ fn make_params(args: ViewArgs) -> HairParams {
             args.dom_near,
             args.dom_far,
         ],
+        rect: args.rect,
     }
 }
 
@@ -714,6 +738,34 @@ fn light_views(extracted: &ExtractedFrame) -> Vec<LightView> {
         channel: key.and_then(|index| lights[index].channel),
     });
     views
+}
+
+/// What the deep opacity maps depend on: the groom's placement and every
+/// light view. `None` unless exactly one groom renders maps, since grooms share
+/// `targets.dom` and the key map has to survive until the next frame's shading.
+fn dom_signature(
+    extracted: &ExtractedFrame,
+    grooms: &HashMap<AssetId<HairMesh>, GpuGroom>,
+    views: &[LightView],
+) -> Option<Vec<f32>> {
+    let mut casting = extracted
+        .grooms
+        .iter()
+        .filter(|groom| groom.deep_opacity && grooms.contains_key(&groom.asset));
+    let groom = casting.next()?;
+    if casting.next().is_some() {
+        return None;
+    }
+    let gpu = &grooms[&groom.asset];
+    let mut signature = groom.world_from_model.to_cols_array().to_vec();
+    for view in views {
+        signature.push(view.channel.map_or(-1.0, f32::from));
+        match view.source.fit(gpu, groom.world_from_model) {
+            Some(fit) => signature.extend(fit.clip.to_cols_array()),
+            None => signature.push(f32::NAN),
+        }
+    }
+    Some(signature)
 }
 
 fn key_index(lights: &[ExtractedDirectional]) -> Option<usize> {
@@ -862,6 +914,7 @@ fn render_dom(
         dom_scale: (fit.far - fit.near) / LAYER_COUNT as f32,
         pass_mode: [1, gpu.bundle_count, u32::from(reverse), 1],
         light_eye: fit.eye,
+        rect: [0, 0, DOM_SIZE, DOM_SIZE],
     });
     let mut opacity_params = depth_params;
     opacity_params.pass_mode[0] = 2;
@@ -929,6 +982,36 @@ fn render_dom(
     }
 }
 
+/// Strand pixels reach past the projected center line by the diagonal fill.
+const RECT_PAD: f32 = 2.0;
+
+/// The groom's projected bounds in pixels, as `[x0, y0, x1, y1)`, never empty.
+/// The whole screen when a corner is behind the camera.
+fn screen_rect(
+    gpu: &GpuGroom,
+    world_from_model: Mat4,
+    clip_from_world: Mat4,
+    width: u32,
+    height: u32,
+) -> [u32; 4] {
+    let size = Vec2::new(width as f32, height as f32);
+    let mut min = Vec2::splat(f32::MAX);
+    let mut max = Vec2::splat(f32::MIN);
+    for corner in world_corners(gpu, world_from_model) {
+        let clip = clip_from_world * corner.extend(1.0);
+        if clip.w <= 1e-3 {
+            return [0, 0, width, height];
+        }
+        let ndc = clip.truncate().truncate() / clip.w;
+        let screen = Vec2::new(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * size;
+        min = min.min(screen);
+        max = max.max(screen);
+    }
+    let min = (min - RECT_PAD).floor().clamp(Vec2::ZERO, size - 1.0);
+    let max = (max + RECT_PAD).ceil().clamp(min + 1.0, size);
+    [min.x as u32, min.y as u32, max.x as u32, max.y as u32]
+}
+
 fn depth_is_reverse(clip: Mat4, camera: Vec3, forward: Vec3) -> bool {
     let near = clip_z(clip, camera + forward * 0.5);
     let far = clip_z(clip, camera + forward * 30.0);
@@ -949,6 +1032,8 @@ fn ensure_targets(device: &RenderDevice, frame: &mut FrameGpu, width: u32, heigh
         return;
     }
     let pixels = width as u64 * height as u64;
+    frame.dom_signature = None;
+    frame.written_rect = None;
     frame.targets = Some(ScreenTargets {
         width,
         height,
@@ -1112,6 +1197,7 @@ struct ShadeDraw<'a> {
     mesh_view: &'a MeshViewBindGroup,
     environment_map: bool,
     shade_view: &'a TextureView,
+    rect: [u32; 4],
     buffers: ShadeBuffers<'a>,
 }
 
@@ -1122,6 +1208,7 @@ fn draw_shade(ctx: &mut RenderContext, cache: &PipelineCache, draw: ShadeDraw<'_
         mesh_view,
         environment_map,
         shade_view,
+        rect,
         buffers: ShadeBuffers { params, targets },
     } = draw;
     let hair = ctx.render_device().create_bind_group(
@@ -1156,6 +1243,7 @@ fn draw_shade(ctx: &mut RenderContext, cache: &PipelineCache, draw: ShadeDraw<'_
             multiview_mask: None,
         });
     pass.set_pipeline(pipeline);
+    pass.set_scissor_rect(rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1]);
     pass.set_bind_group(0, &mesh_view.main, &mesh_view.main_offsets);
     if environment_map {
         pass.set_bind_group(1, &mesh_view.binding_array, &[]);

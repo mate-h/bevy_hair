@@ -9,11 +9,10 @@ use bevy::render::render_resource::*;
 const COMMON: &str = include_str!("shaders/common.wgsl");
 
 /// `HairParams` uniform size. Keep in sync with `shaders/common.wgsl`.
-pub const HAIR_PARAMS_SIZE: u64 = 432;
+pub const HAIR_PARAMS_SIZE: u64 = 448;
 
 #[derive(Resource, Clone)]
 pub struct HairShaderHandles {
-    pub clear: Handle<Shader>,
     pub clear_dom: Handle<Shader>,
     pub lod: Handle<Shader>,
     pub scan: Handle<Shader>,
@@ -25,12 +24,6 @@ pub struct HairShaderHandles {
 
 pub fn load_shaders(shaders: &mut Assets<Shader>) -> HairShaderHandles {
     HairShaderHandles {
-        clear: shader(
-            shaders,
-            "hair_clear.wgsl",
-            include_str!("shaders/clear.wgsl"),
-            false,
-        ),
         clear_dom: shader(
             shaders,
             "hair_clear_dom.wgsl",
@@ -73,8 +66,6 @@ pub fn load_shaders(shaders: &mut Assets<Shader>) -> HairShaderHandles {
 
 #[derive(Resource)]
 pub struct HairPipelines {
-    pub clear: CachedComputePipelineId,
-    pub clear_layout: BindGroupLayoutDescriptor,
     pub clear_dom: CachedComputePipelineId,
     pub clear_dom_layout: BindGroupLayoutDescriptor,
     pub lod: CachedComputePipelineId,
@@ -97,7 +88,6 @@ pub fn init_pipelines(
     mesh_pipeline: Res<MeshPipeline>,
 ) {
     let HairShaderHandles {
-        clear,
         clear_dom,
         lod,
         scan,
@@ -107,10 +97,6 @@ pub fn init_pipelines(
         composite,
     } = shader_handles.clone();
 
-    let clear_layout = BindGroupLayoutDescriptor::new(
-        "hair_clear",
-        &BindGroupLayoutEntries::sequential(ShaderStages::COMPUTE, (rw(8), rw(8), rw(4))),
-    );
     let clear_dom_layout = BindGroupLayoutDescriptor::new(
         "hair_clear_dom",
         &BindGroupLayoutEntries::sequential(ShaderStages::COMPUTE, (rw(4),)),
@@ -180,8 +166,6 @@ pub fn init_pipelines(
         };
 
     let pipelines = HairPipelines {
-        clear: queue("hair_clear", &clear_layout, &clear),
-        clear_layout,
         clear_dom: queue("hair_clear_dom", &clear_dom_layout, &clear_dom),
         clear_dom_layout,
         lod: queue("hair_lod", &lod_layout, &lod),
@@ -352,7 +336,6 @@ mod shader_parse {
 
     #[test]
     fn shaders_parse() {
-        parse("clear", include_str!("shaders/clear.wgsl"));
         parse("clear_dom", include_str!("shaders/clear_dom.wgsl"));
         parse("lod", &with_common(include_str!("shaders/lod.wgsl")));
         parse("scan", &with_common(include_str!("shaders/scan.wgsl")));

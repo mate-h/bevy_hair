@@ -77,7 +77,9 @@ fn eval_cp(idx: u32, ncp: u32, uv: vec2<f32>, style_offset: u32) -> vec4<f32> {
 fn write_pixel(pixel: vec2<i32>, t: f32, p0: vec3<f32>, p1: vec3<f32>, t0: vec3<f32>, t1: vec3<f32>, uvw0: vec3<f32>, uvw1: vec3<f32>, ao0: f32, ao1: f32, center_hit: bool, beta: f32) {
     let width = i32(params.screen.x);
     let height = i32(params.screen.y);
-    if pixel.x < 0 || pixel.y < 0 || pixel.x >= width || pixel.y >= height {
+    // Outside the rectangle the G-buffer is not cleared.
+    let rect = vec4<i32>(params.rect);
+    if any(pixel < rect.xy) || any(pixel >= rect.zw) {
         return;
     }
     let world = mix(p0, p1, t);
@@ -107,11 +109,12 @@ fn write_pixel(pixel: vec2<i32>, t: f32, p0: vec3<f32>, p1: vec3<f32>, t0: vec3<
     }
     let payload = pack_gb(depth, oct.x, oct.y, quant_uvw(uvw), ao_q);
     let pix = u32(pixel.y) * u32(width) + u32(pixel.x);
-    atomicMin(&conservative[pix], payload);
+    // Complements, so buffers clear to zero (see `unpack_gb`).
+    atomicMax(&conservative[pix], ~payload);
     if center_hit {
-        atomicMin(&center[pix], payload);
+        atomicMax(&center[pix], ~payload);
         let beta_q = u32(clamp(beta, 0.0, 1.0) * 255.0 + 0.5);
-        atomicMin(&beta_buf[pix], (depth << 8u) | beta_q);
+        atomicMax(&beta_buf[pix], ~((depth << 8u) | beta_q));
     }
 }
 

@@ -25,6 +25,8 @@ struct HairParams {
     light_eye: vec4<f32>,
     light_forward: vec4<f32>,
     dom_info: vec4<f32>,
+    // Camera passes: the groom's screen rectangle, [x0, y0, x1, y1).
+    rect: vec4<u32>,
 }
 
 struct BundleInfo {
@@ -91,7 +93,10 @@ struct Unpacked {
     ao: u32,
 }
 
-fn unpack_gb(word: u64) -> Unpacked {
+// The G-buffer stores the complement of `pack_gb`, so a cleared (zero) word is
+// empty and `atomicMax` keeps the nearest fragment.
+fn unpack_gb(stored: u64) -> Unpacked {
+    let word = ~stored;
     let low = gb_low(word);
     let high = gb_high(word);
     return Unpacked(
@@ -103,8 +108,8 @@ fn unpack_gb(word: u64) -> Unpacked {
     );
 }
 
-fn is_empty(word: u64) -> bool {
-    return (gb_high(word) >> 8u) == 0x00ffffffu;
+fn is_empty(stored: u64) -> bool {
+    return stored == 0lu;
 }
 
 fn quantize_depth(dist: f32, near: f32, far: f32) -> u32 {
