@@ -1,5 +1,5 @@
 // Fragment shader for `HairShadowMaterial`. A standard PBR surface whose lights
-// on custom shadow channels are attenuated by the hair's deep opacity map from
+// on material shadow channels are attenuated by the hair's deep opacity map from
 // that light.
 
 import bevy_pbr::render::{
@@ -17,7 +17,7 @@ struct ShadowLight {
     depth: vec4<f32>,
 }
 
-// Keep in sync with `MAX_CUSTOM_SHADOW_CHANNELS` in Bevy.
+// Keep in sync with `MAX_MATERIAL_SHADOW_CHANNELS` in Bevy.
 const CHANNELS: u32 = 4u;
 
 // One map of `DOM_WORDS` per channel.
@@ -91,7 +91,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         pbr_input.material.base_color,
     );
     for (var channel = 0u; channel < CHANNELS; channel++) {
-        pbr_input.custom_shadow_factors[channel] =
+        pbr_input.material_shadow_factors[channel] =
             hair_visibility(channel, in.world_position.xyz);
     }
 

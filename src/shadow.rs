@@ -8,7 +8,7 @@ use bevy::shader::ShaderRef;
 
 /// A [`StandardMaterial`] that hair shadows. [`crate::HairPlugin`] renders a
 /// deep opacity map from every directional, point, and spot light with a
-/// [`CustomShadowChannel`](bevy::light::CustomShadowChannel), and the material
+/// [`MaterialShadowChannel`](bevy::light::MaterialShadowChannel), and the material
 /// attenuates each light by the strands between the surface and that light.
 /// Give each light its own channel. Build the extension with
 /// [`HairShadow::receiver`].
@@ -33,7 +33,7 @@ impl MaterialExtension for HairShadowReceiver {
 }
 
 /// The deep opacity maps [`crate::HairPlugin`] publishes for materials, one per
-/// custom shadow channel. With several grooms, the last one drawn casts.
+/// material shadow channel. With several grooms, the last one drawn casts.
 #[derive(Resource, Clone)]
 pub struct HairShadow {
     pub(crate) dom: Handle<ShaderBuffer>,

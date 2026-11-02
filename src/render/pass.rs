@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use bevy::asset::AssetId;
 use bevy::ecs::system::SystemParam;
-use bevy::light::MAX_CUSTOM_SHADOW_CHANNELS;
+use bevy::light::MAX_MATERIAL_SHADOW_CHANNELS;
 use bevy::math::{Mat4, Vec2, Vec3, Vec4};
 use bevy::pbr::{MeshPipelineViewLayoutKey, MeshViewBindGroup, ViewKeyCache};
 use bevy::prelude::*;
@@ -29,8 +29,8 @@ const DOM_SIGMA: f32 = 0.05;
 pub const DOM_BYTES: u64 = (DOM_SIZE * DOM_SIZE * (1 + DOM_LAYERS)) as u64 * 4;
 pub const SHADOW_LIGHT_BYTES: u64 = size_of::<ShadowLight>() as u64;
 
-pub const SHADOW_CHANNELS: usize = MAX_CUSTOM_SHADOW_CHANNELS as usize;
-/// One deep opacity map per custom shadow channel, plus the key light's when
+pub const SHADOW_CHANNELS: usize = MAX_MATERIAL_SHADOW_CHANNELS as usize;
+/// One deep opacity map per material shadow channel, plus the key light's when
 /// it has no channel.
 const DOM_VIEWS: usize = SHADOW_CHANNELS + 1;
 

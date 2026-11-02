@@ -9,7 +9,7 @@ use bevy::camera::visibility::Visibility;
 use bevy::core_pipeline::core_3d::{main_opaque_pass_3d, main_transparent_pass_3d};
 use bevy::core_pipeline::{Core3d, Core3dSystems};
 use bevy::ecs::system::ResMut;
-use bevy::light::{CustomShadowChannel, MAX_CUSTOM_SHADOW_CHANNELS};
+use bevy::light::{MAX_MATERIAL_SHADOW_CHANNELS, MaterialShadowChannel};
 use bevy::math::{Mat4, Vec3, Vec4};
 use bevy::pbr::MeshPipelineSystems;
 use bevy::prelude::*;
@@ -85,7 +85,7 @@ impl Plugin for HairPlugin {
 pub(crate) struct ExtractedFrame {
     pub grooms: Vec<ExtractedGroom>,
     pub directionals: Vec<ExtractedDirectional>,
-    /// Point and spot lights on a custom shadow channel.
+    /// Point and spot lights on a material shadow channel.
     pub positionals: Vec<ExtractedPositional>,
     meshes: HashMap<AssetId<HairMesh>, HairMesh>,
 }
@@ -118,21 +118,21 @@ pub(crate) struct ExtractedPositional {
 type DirectionalCaster = (
     &'static DirectionalLight,
     &'static GlobalTransform,
-    Option<&'static CustomShadowChannel>,
+    Option<&'static MaterialShadowChannel>,
 );
 
 type PositionalCaster = (
     &'static GlobalTransform,
-    &'static CustomShadowChannel,
+    &'static MaterialShadowChannel,
     &'static InheritedVisibility,
 );
 
 type PositionalLight = Or<(With<PointLight>, With<SpotLight>)>;
 
-fn valid_channel(channel: Option<&CustomShadowChannel>) -> Option<u8> {
+fn valid_channel(channel: Option<&MaterialShadowChannel>) -> Option<u8> {
     channel
         .map(|channel| channel.0)
-        .filter(|&channel| channel < MAX_CUSTOM_SHADOW_CHANNELS)
+        .filter(|&channel| channel < MAX_MATERIAL_SHADOW_CHANNELS)
 }
 
 fn extract_hair(

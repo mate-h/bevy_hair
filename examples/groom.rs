@@ -18,7 +18,7 @@ use std::fmt;
 
 use bevy::app::{PluginGroup, RunFixedMainLoop, RunFixedMainLoopSystems};
 use bevy::camera::Hdr;
-use bevy::light::{CascadeShadowConfigBuilder, CustomShadowChannel};
+use bevy::light::{CascadeShadowConfigBuilder, MaterialShadowChannel};
 use bevy::log::LogPlugin;
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
@@ -309,7 +309,7 @@ fn setup(
         }
         .build(),
         Transform::from_translation(key).looking_at(focus, Vec3::Y),
-        CustomShadowChannel(0),
+        MaterialShadowChannel(0),
     ));
 
     // Studio directions in the opening camera's frame. `right` is screen right.
@@ -330,7 +330,7 @@ fn setup(
             ..default()
         },
         Transform::from_translation(focus + fill * STUDIO_DISTANCE),
-        CustomShadowChannel(1),
+        MaterialShadowChannel(1),
         StudioLight,
     ));
     // Rim from behind and above. Its shadow map lets the head block it from
@@ -347,7 +347,7 @@ fn setup(
             ..default()
         },
         Transform::from_translation(focus + rim * STUDIO_DISTANCE).looking_at(focus, Vec3::Y),
-        CustomShadowChannel(2),
+        MaterialShadowChannel(2),
         StudioLight,
     ));
 }
