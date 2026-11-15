@@ -23,8 +23,9 @@ use crate::shadow::HairShadow;
 pub const DOM_SIZE: u32 = 512;
 /// Opacity slices per light-space texel. Keep in sync with `DOM_LAYERS` in the shaders.
 pub const DOM_LAYERS: u32 = 16;
-/// Beer-Lambert extinction per strand fragment. Visibility is `exp(-hits * DOM_SIGMA)`.
-const DOM_SIGMA: f32 = 0.05;
+/// Fixed-point units per light-map pixel of projected strand length in the
+/// opacity slices. Keep in sync with `DOM_COVERAGE` in the shaders.
+pub const DOM_COVERAGE: f32 = 256.0;
 /// Front depth texels, then `DOM_LAYERS` opacity counts per texel.
 pub const DOM_BYTES: u64 = (DOM_SIZE * DOM_SIZE * (1 + DOM_LAYERS)) as u64 * 4;
 pub const SHADOW_LIGHT_BYTES: u64 = size_of::<ShadowLight>() as u64;
@@ -41,7 +42,8 @@ struct ShadowLight {
     light_clip_from_world: [[f32; 4]; 4],
     light_eye: [f32; 4],
     light_forward: [f32; 4],
-    // x near, y far, z extinction, w 1 once a map exists.
+    // x near, y far, z extinction per coverage unit (over light depth when
+    // perspective), w 0 without a map, 1 orthographic, 2 perspective.
     depth: [f32; 4],
 }
 
@@ -432,16 +434,17 @@ pub fn hair_pass(
             );
         }
         let key = views.last().expect("the key view is always present");
-        let Some(LightFit {
+        let Some(key_fit) = key.source.fit(gpu, groom.world_from_model) else {
+            continue;
+        };
+        let LightFit {
             eye: light_eye,
             forward: light_dir,
             clip: light_clip,
             near: light_near,
             far: light_far,
-        }) = key.source.fit(gpu, groom.world_from_model)
-        else {
-            continue;
-        };
+            ..
+        } = key_fit;
         let (center, radius) = world_extent(gpu, groom.world_from_model);
         let dist = camera_pos.distance(center).max(0.5);
         // 24-bit quantization stays precise across the whole view, so the range
@@ -464,6 +467,8 @@ pub fn hair_pass(
             dom_near: light_near,
             dom_far: light_far,
             dom_scale,
+            dom_extinction: key_fit.extinction(groom),
+            dom_perspective: key_fit.perspective,
             pass_mode: [0, gpu.bundle_count, u32::from(reverse), 0],
             light_eye,
             rect,
@@ -553,7 +558,12 @@ pub fn hair_pass(
                         light_clip_from_world: fit.clip.to_cols_array_2d(),
                         light_eye: fit.eye.extend(1.0).to_array(),
                         light_forward: fit.forward.extend(0.0).to_array(),
-                        depth: [fit.near, fit.far, DOM_SIGMA, 1.0],
+                        depth: [
+                            fit.near,
+                            fit.far,
+                            fit.extinction(groom),
+                            if fit.perspective { 2.0 } else { 1.0 },
+                        ],
                     };
                 }
             }
@@ -658,6 +668,9 @@ struct ViewArgs<'a> {
     dom_near: f32,
     dom_far: f32,
     dom_scale: f32,
+    /// Optical depth per coverage unit, see `LightFit::extinction`.
+    dom_extinction: f32,
+    dom_perspective: bool,
     pass_mode: [u32; 4],
     light_eye: Vec3,
     rect: [u32; 4],
@@ -678,7 +691,7 @@ fn make_params(args: ViewArgs) -> HairParams {
             args.groom.lambda,
             args.groom.center_diameter,
         ],
-        filter_params: [1.0, 0.2, args.dom_scale.max(1e-3), DOM_SIGMA],
+        filter_params: [1.0, 0.2, args.dom_scale.max(1e-3), args.dom_extinction],
         albedo: args.groom.albedo.to_array(),
         flags: [
             flag(args.groom.lod),
@@ -688,7 +701,11 @@ fn make_params(args: ViewArgs) -> HairParams {
         ],
         pass_mode: args.pass_mode,
         light_eye: args.light_eye.extend(1.0).to_array(),
-        light_forward: args.light_forward.extend(0.0).to_array(),
+        // w flags a perspective map, whose extinction falls off with depth.
+        light_forward: args
+            .light_forward
+            .extend(f32::from(u8::from(args.dom_perspective)))
+            .to_array(),
         dom_info: [
             DOM_SIZE as f32,
             DOM_SIZE as f32,
@@ -758,6 +775,8 @@ fn dom_signature(
     }
     let gpu = &grooms[&groom.asset];
     let mut signature = groom.world_from_model.to_cols_array().to_vec();
+    // Receivers keep the extinction published with the maps.
+    signature.push(groom.fiber_width);
     for view in views {
         signature.push(view.channel.map_or(-1.0, f32::from));
         match view.source.fit(gpu, groom.world_from_model) {
@@ -807,6 +826,21 @@ struct LightFit {
     clip: Mat4,
     near: f32,
     far: f32,
+    /// World width of one map texel: constant for an orthographic map, per
+    /// unit of light depth for a perspective one.
+    texel: f32,
+    perspective: bool,
+}
+
+impl LightFit {
+    /// Optical depth per `DOM_COVERAGE` unit. A fiber of width `d` crossing
+    /// `l` pixels of a texel `w` wide covers `d * l / w` of it, which is the
+    /// expected number of fibers a light ray through that texel meets.
+    /// Perspective maps divide this by the slice's light depth.
+    fn extinction(&self, groom: &ExtractedGroom) -> f32 {
+        let scale = groom.world_from_model.determinant().abs().cbrt();
+        groom.fiber_width * scale / (self.texel * DOM_COVERAGE)
+    }
 }
 
 impl LightSource {
@@ -845,13 +879,19 @@ impl LightSource {
             .looking_to(forward, up)
             .to_matrix()
             .inverse();
-        let proj = match *self {
-            LightSource::Directional(_) => {
-                bevy::math::proj::orthographic(-radius, radius, -radius, radius, near, far)
-            }
+        let (proj, texel, perspective) = match *self {
+            LightSource::Directional(_) => (
+                bevy::math::proj::orthographic(-radius, radius, -radius, radius, near, far),
+                2.0 * radius / DOM_SIZE as f32,
+                false,
+            ),
             LightSource::Positional(_) => {
                 let half = (radius / eye.distance(center)).asin();
-                bevy::math::proj::perspective(half * 2.0, 1.0, near, far)
+                (
+                    bevy::math::proj::perspective(half * 2.0, 1.0, near, far),
+                    2.0 * half.tan() / DOM_SIZE as f32,
+                    true,
+                )
             }
         };
         Some(LightFit {
@@ -860,6 +900,8 @@ impl LightSource {
             clip: proj * view,
             near,
             far,
+            texel,
+            perspective,
         })
     }
 }
@@ -912,6 +954,8 @@ fn render_dom(
         dom_near: fit.near,
         dom_far: fit.far,
         dom_scale: (fit.far - fit.near) / LAYER_COUNT as f32,
+        dom_extinction: fit.extinction(groom),
+        dom_perspective: fit.perspective,
         pass_mode: [1, gpu.bundle_count, u32::from(reverse), 1],
         light_eye: fit.eye,
         rect: [0, 0, DOM_SIZE, DOM_SIZE],
@@ -1328,6 +1372,15 @@ mod dom_layout {
         assert!(
             receiver.contains(&size),
             "{size} missing from hair_shadow.wesl"
+        );
+        let coverage = format!("const DOM_COVERAGE: f32 = {:?};", super::DOM_COVERAGE);
+        assert!(
+            common.contains(&coverage),
+            "{coverage} missing from common.wgsl"
+        );
+        assert!(
+            receiver.contains(&coverage),
+            "{coverage} missing from hair_shadow.wesl"
         );
     }
 }

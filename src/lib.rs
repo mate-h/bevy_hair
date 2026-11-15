@@ -44,6 +44,11 @@ pub struct HairGroom {
     pub deep_opacity: bool,
     /// Diameter, in pixels, of the center-sample acceptance disk.
     pub center_diameter: f32,
+    /// Fiber diameter in the hair mesh's units. Sets how much light each strand
+    /// blocks in the deep opacity maps, independent of their resolution. The
+    /// default is 100 µm in metres. A groom with fewer strands than real hair
+    /// needs proportionally wider fibers to stay as dense.
+    pub fiber_width: f32,
 }
 
 impl Default for HairGroom {
@@ -59,6 +64,7 @@ impl Default for HairGroom {
             ambient_occlusion: true,
             deep_opacity: true,
             center_diameter: 1.0,
+            fiber_width: 1e-4,
         }
     }
 }

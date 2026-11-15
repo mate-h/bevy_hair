@@ -118,7 +118,9 @@ fn write_pixel(pixel: vec2<i32>, t: f32, p0: vec3<f32>, p1: vec3<f32>, t0: vec3<
     }
 }
 
-fn write_dom_pixel(pixel: vec2<i32>, world: vec3<f32>) {
+// `coverage` is the strand's projected length inside the texel, in
+// `DOM_COVERAGE` units. Only the opacity pass uses it.
+fn write_dom_pixel(pixel: vec2<i32>, world: vec3<f32>, coverage: u32) {
     let width = i32(params.screen.x);
     let height = i32(params.screen.y);
     if pixel.x < 0 || pixel.y < 0 || pixel.x >= width || pixel.y >= height {
@@ -147,7 +149,7 @@ fn write_dom_pixel(pixel: vec2<i32>, world: vec3<f32>) {
     let t = max(dist - z_front, 0.0) / thickness;
     let slice = min(u32(t), DOM_LAYERS - 1u);
     let pixels = dom_w * u32(params.dom_info.y);
-    atomicAdd(&dom[pixels + pix * DOM_LAYERS + slice], 1u);
+    atomicAdd(&dom[pixels + pix * DOM_LAYERS + slice], coverage);
 }
 
 fn draw_dom_segment(p0: vec3<f32>, p1: vec3<f32>, include_start: bool) {
@@ -170,11 +172,16 @@ fn draw_dom_segment(p0: vec3<f32>, p1: vec3<f32>, include_start: bool) {
     // The next segment owns a shared screen-space endpoint. A segment that
     // stays in one pixel is moving along the light and has to bin its own depth.
     var skip = !include_start && (x0 != x1 || y0 != y1);
+    // A strand of width d covers d * length / w² of a texel of width w, so
+    // each texel gets its share of the projected length, not a whole hit.
+    // Strands running along the light cover little of the texels they cross.
+    let written = max(dx, dy) + select(1, 0, skip);
+    let coverage = u32(sqrt(dot(seg, seg)) / f32(written) * DOM_COVERAGE + 0.5);
     for (var step = 0; step < 1024; step++) {
         if !skip {
             let center = vec2<f32>(f32(x0), f32(y0)) + 0.5;
             let t = clamp(dot(center - a.screen, seg) / seg_len2, 0.0, 1.0);
-            write_dom_pixel(vec2<i32>(x0, y0), mix(p0, p1, t));
+            write_dom_pixel(vec2<i32>(x0, y0), mix(p0, p1, t), coverage);
         }
         skip = false;
         if x0 == x1 && y0 == y1 {

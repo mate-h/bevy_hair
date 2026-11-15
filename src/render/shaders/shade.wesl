@@ -243,17 +243,24 @@ fn hair_bsdf(
     return color * shadow;
 }
 
-fn dom_optical_depth(pix: u32, t: f32) -> f32 {
+// Optical depth per `DOM_COVERAGE` unit at light depth `z`: fiber width over
+// texel width. A perspective map's texels widen with depth.
+fn dom_extinction(z: f32) -> f32 {
+    let k = params.filter_params.w;
+    return select(k, k / max(z, 1e-3), params.light_forward.w > 0.5);
+}
+
+// Expected fibers crossed between the front of the texel and `t` slices in.
+fn dom_optical_depth(pix: u32, t: f32, z_front: f32, thickness: f32) -> f32 {
     let pixels = u32(params.dom_info.x) * u32(params.dom_info.y);
     let base = pixels + pix * DOM_LAYERS;
     var occ = 0.0;
     for (var slice = 0u; slice < DOM_LAYERS; slice++) {
-        let count = f32(dom[base + slice]);
         let i = f32(slice);
-        if i + 1.0 <= t {
-            occ += count;
-        } else if i < t {
-            occ += count * (t - i);
+        let fill = clamp(t - i, 0.0, 1.0);
+        if fill > 0.0 {
+            let z = z_front + (i + 0.5) * thickness;
+            occ += f32(dom[base + slice]) * fill * dom_extinction(z);
         }
     }
     return occ;
@@ -273,7 +280,7 @@ fn dom_texel_visibility(x: i32, y: i32, dist: f32, near: f32, far: f32, dom_w: u
     // A small slack keeps the front surface from reading the opacity it just
     // wrote when reconstruction sits a fraction of a layer behind the map.
     let rel = max(dist - z_front - thickness * 0.05, 0.0);
-    return exp(-dom_optical_depth(pix, rel / thickness) * params.filter_params.w);
+    return exp(-dom_optical_depth(pix, rel / thickness, z_front, thickness));
 }
 
 fn dom_visibility(world: vec3<f32>, beta: f32) -> f32 {

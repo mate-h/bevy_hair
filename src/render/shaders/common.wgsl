@@ -6,6 +6,9 @@ const PI: f32 = 3.14159265;
 // Opacity slices hung off the per-texel front depth. Keep in sync with `DOM_LAYERS`.
 const DOM_LAYERS: u32 = 16u;
 const DOM_EMPTY: u32 = 0xffffffffu;
+// Opacity slices count projected strand length in fixed point, this many units
+// per light-map pixel. Keep in sync with `DOM_COVERAGE` in pass.rs.
+const DOM_COVERAGE: f32 = 256.0;
 
 struct HairParams {
     clip_from_world: mat4x4<f32>,

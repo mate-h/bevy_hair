@@ -233,6 +233,9 @@ fn setup(
             albedo: Color::srgb(0.27, 0.20, 0.15),
             roughness: 0.45,
             tilt: 0.05,
+            // The grooms are in centimetres, and their 50k strands stand in for
+            // roughly twice as many, so each fiber is about twice real width.
+            fiber_width: 0.014,
             ..default()
         },
         model,

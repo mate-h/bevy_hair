@@ -102,6 +102,7 @@ pub(crate) struct ExtractedGroom {
     ambient_occlusion: bool,
     deep_opacity: bool,
     center_diameter: f32,
+    fiber_width: f32,
 }
 
 pub(crate) struct ExtractedDirectional {
@@ -167,6 +168,7 @@ fn extract_hair(
             ambient_occlusion: groom.ambient_occlusion,
             deep_opacity: groom.deep_opacity,
             center_diameter: groom.center_diameter,
+            fiber_width: groom.fiber_width,
         });
     }
     for (light, transform, channel) in &lights {

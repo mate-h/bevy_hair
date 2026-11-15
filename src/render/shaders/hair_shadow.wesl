@@ -13,7 +13,8 @@ struct ShadowLight {
     light_clip_from_world: mat4x4<f32>,
     light_eye: vec4<f32>,
     light_forward: vec4<f32>,
-    // x near, y far, z extinction per strand fragment, w 1 once a map exists.
+    // x near, y far, z extinction per `DOM_COVERAGE` unit (divided by light
+    // depth when perspective), w 0 without a map, 1 orthographic, 2 perspective.
     depth: vec4<f32>,
 }
 
@@ -28,6 +29,8 @@ const CHANNELS: u32 = 4u;
 const DOM_SIZE: u32 = 512u;
 const DOM_LAYERS: u32 = 16u;
 const DOM_EMPTY: u32 = 0xffffffffu;
+// Keep in sync with `DOM_COVERAGE` in pass.rs.
+const DOM_COVERAGE: f32 = 256.0;
 const DOM_WORDS: u32 = DOM_SIZE * DOM_SIZE * (1u + DOM_LAYERS);
 
 // Same slice integration as `dom_texel_visibility` in `shade.wesl`, without the
@@ -49,11 +52,17 @@ fn texel_visibility(channel: u32, x: i32, y: i32, dist: f32) -> f32 {
     let thickness = max(far - near, 1e-3) / f32(DOM_LAYERS);
     let t = max(dist - z_front, 0.0) / thickness;
     let base = map + DOM_SIZE * DOM_SIZE + pix * DOM_LAYERS;
-    var hits = 0.0;
+    let perspective = light.depth.w > 1.5;
+    var occ = 0.0;
     for (var slice = 0u; slice < DOM_LAYERS; slice++) {
-        hits += f32(hair_dom[base + slice]) * clamp(t - f32(slice), 0.0, 1.0);
+        let fill = clamp(t - f32(slice), 0.0, 1.0);
+        if fill > 0.0 {
+            let z = z_front + (f32(slice) + 0.5) * thickness;
+            let extinction = select(light.depth.z, light.depth.z / max(z, 1e-3), perspective);
+            occ += f32(hair_dom[base + slice]) * fill * extinction;
+        }
     }
-    return exp(-hits * light.depth.z);
+    return exp(-occ);
 }
 
 fn hair_visibility(channel: u32, world: vec3<f32>) -> f32 {
