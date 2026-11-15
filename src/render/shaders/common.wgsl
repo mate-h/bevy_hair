@@ -79,10 +79,15 @@ fn pcg(input: u32) -> u32 {
     return (word >> 22u) ^ word;
 }
 
-fn pcg_uv(seed: u32) -> vec2<f32> {
-    let a = pcg(seed);
-    let b = pcg(a ^ 0x9e3779b9u);
-    return vec2<f32>(f32(a), f32(b)) * (1.0 / 4294967296.0);
+// Where strand `strand` roots in its bundle's quad. The R2 sequence (Roberts
+// 2018) spreads any prefix evenly, so the first `n_lod` strands LOD keeps
+// cover the bundle without clumps or gaps. A per-bundle offset keeps
+// neighboring bundles from lining up. 0.32 fixed point wraps exactly.
+fn strand_uv(bundle: u32, strand: u32) -> vec2<f32> {
+    let a = pcg(bundle * 0x85ebca6bu);
+    let offset = vec2<u32>(a, pcg(a ^ 0x9e3779b9u));
+    let x = offset + strand * vec2<u32>(3242174889u, 2447445414u);
+    return vec2<f32>(x) * (1.0 / 4294967296.0);
 }
 
 fn pack_gb(depth: u32, tx: u32, ty: u32, uvw: vec3<u32>, ao: u32) -> u64 {

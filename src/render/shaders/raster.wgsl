@@ -239,7 +239,7 @@ fn main(
 ) {
     let strand = refs[wg.x];
     let bundle = bundles[strand.bundle];
-    let uv = pcg_uv(strand.strand ^ (strand.bundle * 0x85ebca6bu));
+    let uv = strand_uv(strand.bundle, strand.strand);
 
     // Neighbors come from shared memory after each barrier. Subgroup shuffles
     // would assume the subgroup is the workgroup, which WGSL does not promise.
