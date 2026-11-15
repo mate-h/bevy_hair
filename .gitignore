@@ -1,2 +1,6 @@
 target/
 **/*.DS_Store
+
+# Beads issue tracker (local only)
+.beads/
+.beads.gate.lock*
