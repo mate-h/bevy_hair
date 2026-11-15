@@ -13,11 +13,11 @@ use bevy::render::storage::GpuShaderBuffer;
 use bevy::render::view::{ViewDepthStencilTexture, ViewTarget};
 use bytemuck::{Pod, Zeroable};
 
-use crate::mesh::{HairMesh, LAYER_COUNT};
+use crate::mesh::HairMesh;
 use crate::render::pipeline::{
     HAIR_PARAMS_SIZE, HairPipelines, HairShadePipeline, queue_composite,
 };
-use crate::render::{ExtractedDirectional, ExtractedFrame, ExtractedGroom, flag};
+use crate::render::{ExtractedFrame, ExtractedGroom, flag};
 use crate::shadow::HairShadow;
 
 pub const DOM_SIZE: u32 = 512;
@@ -103,6 +103,8 @@ pub struct GpuGroom {
     /// Per light view, since every map's parameters are written before the
     /// frame's commands run.
     pub dom_params: Vec<DomParams>,
+    /// This groom's view for every channel map, for its own shading.
+    pub shade_lights: Buffer,
 }
 
 pub struct DomParams {
@@ -184,6 +186,12 @@ impl GpuGroom {
                     ),
                 })
                 .collect(),
+            shade_lights: zeros(
+                device,
+                "hair_shade_lights",
+                SHADOW_LIGHT_BYTES * SHADOW_CHANNELS as u64,
+                BufferKind::Uniform,
+            ),
         }
     }
 }
@@ -433,26 +441,22 @@ pub fn hair_pass(
                 Some(u64::from(rows[1] - rows[0]) * row),
             );
         }
-        let key = views.last().expect("the key view is always present");
-        let Some(key_fit) = key.source.fit(gpu, groom.world_from_model) else {
-            continue;
-        };
-        let LightFit {
-            eye: light_eye,
-            forward: light_dir,
-            clip: light_clip,
-            near: light_near,
-            far: light_far,
-            ..
-        } = key_fit;
+        // Shades a key directional without a channel. Lights on a channel read
+        // their map from `shadow_dom`.
+        let key_fit = views
+            .iter()
+            .find(|view| view.key)
+            .and_then(|view| view.source.fit(gpu, groom.world_from_model));
+        let (light_eye, light_dir, light_clip, light_near, light_far) = key_fit.as_ref().map_or(
+            (Vec3::ZERO, Vec3::NEG_Y, Mat4::IDENTITY, 0.05, 1.0),
+            |fit| (fit.eye, fit.forward, fit.clip, fit.near, fit.far),
+        );
         let (center, radius) = world_extent(gpu, groom.world_from_model);
         let dist = camera_pos.distance(center).max(0.5);
         // 24-bit quantization stays precise across the whole view, so the range
         // only has to contain the groom. A tight near plane drops the front strands.
         let cam_near = 0.05;
         let cam_far = (dist + radius * 4.0).max(cam_near + 1.0);
-        // Eq. 8 is one hair-mesh layer of light-view depth per e-fold of strand removal.
-        let dom_scale = (light_far - light_near) / LAYER_COUNT as f32;
 
         let camera_params = make_params(ViewArgs {
             clip_from_world,
@@ -466,9 +470,9 @@ pub fn hair_pass(
             light_forward: light_dir,
             dom_near: light_near,
             dom_far: light_far,
-            dom_scale,
-            dom_extinction: key_fit.extinction(groom),
-            dom_perspective: key_fit.perspective,
+            dom_extinction: key_fit.as_ref().map_or(0.0, |fit| fit.extinction(groom)),
+            dom_perspective: key_fit.as_ref().is_some_and(|fit| fit.perspective),
+            has_key: key_fit.is_some(),
             pass_mode: [0, gpu.bundle_count, u32::from(reverse), 0],
             light_eye,
             rect,
@@ -554,20 +558,24 @@ pub fn hair_pass(
                         channel as u64 * DOM_BYTES,
                         DOM_BYTES,
                     );
-                    shadow_lights[channel as usize] = ShadowLight {
-                        light_clip_from_world: fit.clip.to_cols_array_2d(),
-                        light_eye: fit.eye.extend(1.0).to_array(),
-                        light_forward: fit.forward.extend(0.0).to_array(),
-                        depth: [
-                            fit.near,
-                            fit.far,
-                            fit.extinction(groom),
-                            if fit.perspective { 2.0 } else { 1.0 },
-                        ],
-                    };
+                    shadow_lights[channel as usize] = fit.shadow_light(groom);
                 }
             }
         }
+
+        // Channel maps sit in `shadow_dom`: copied above, or kept from the
+        // frame that rendered them.
+        let mut groom_lights = [ShadowLight::zeroed(); SHADOW_CHANNELS];
+        if groom.deep_opacity && shadow_dom.is_some() {
+            for view in &views {
+                if let (Some(channel), Some(fit)) =
+                    (view.channel, view.source.fit(gpu, groom.world_from_model))
+                {
+                    groom_lights[channel as usize] = fit.shadow_light(groom);
+                }
+            }
+        }
+        queue.write_buffer(&gpu.shade_lights, 0, bytemuck::cast_slice(&groom_lights));
 
         draw_shade(
             &mut ctx,
@@ -582,6 +590,8 @@ pub fn hair_pass(
                 buffers: ShadeBuffers {
                     params: &gpu.camera_params,
                     targets,
+                    channel_dom: shadow_dom.map_or(&targets.dom, |dom| &dom.buffer),
+                    lights: &gpu.shade_lights,
                 },
             },
         );
@@ -667,10 +677,11 @@ struct ViewArgs<'a> {
     light_forward: Vec3,
     dom_near: f32,
     dom_far: f32,
-    dom_scale: f32,
     /// Optical depth per coverage unit, see `LightFit::extinction`.
     dom_extinction: f32,
     dom_perspective: bool,
+    /// Whether `light_*` describe a key map for shading.
+    has_key: bool,
     pass_mode: [u32; 4],
     light_eye: Vec3,
     rect: [u32; 4],
@@ -691,7 +702,7 @@ fn make_params(args: ViewArgs) -> HairParams {
             args.groom.lambda,
             args.groom.center_diameter,
         ],
-        filter_params: [1.0, 0.2, args.dom_scale.max(1e-3), args.dom_extinction],
+        filter_params: [1.0, 0.2, 0.0, args.dom_extinction],
         albedo: args.groom.albedo.to_array(),
         flags: [
             flag(args.groom.lod),
@@ -700,7 +711,10 @@ fn make_params(args: ViewArgs) -> HairParams {
             flag(args.groom.deep_opacity),
         ],
         pass_mode: args.pass_mode,
-        light_eye: args.light_eye.extend(1.0).to_array(),
+        light_eye: args
+            .light_eye
+            .extend(f32::from(u8::from(args.has_key)))
+            .to_array(),
         // w flags a perspective map, whose extinction falls off with depth.
         light_forward: args
             .light_forward
@@ -725,13 +739,16 @@ enum LightSource {
 struct LightView {
     source: LightSource,
     channel: Option<u8>,
+    /// The first shadowed directional. Its map renders last and stays in
+    /// `targets.dom` for shading when it has no channel.
+    key: bool,
 }
 
 /// The maps to render this frame: every channel light, then the key
-/// directional, whose map also drives hair self-shadowing.
+/// directional, the first one that casts shadows, if there is one.
 fn light_views(extracted: &ExtractedFrame) -> Vec<LightView> {
     let lights = &extracted.directionals;
-    let key = key_index(lights);
+    let key = lights.iter().position(|light| light.casts_shadows);
     let mut views: Vec<LightView> = lights
         .iter()
         .enumerate()
@@ -740,20 +757,22 @@ fn light_views(extracted: &ExtractedFrame) -> Vec<LightView> {
             light.channel.map(|channel| LightView {
                 source: LightSource::Directional(light.direction_to_light),
                 channel: Some(channel),
+                key: false,
             })
         })
         .chain(extracted.positionals.iter().map(|light| LightView {
             source: LightSource::Positional(light.position),
             channel: Some(light.channel),
+            key: false,
         }))
         .collect();
-    views.push(LightView {
-        source: LightSource::Directional(
-            key.map(|index| lights[index].direction_to_light)
-                .unwrap_or_else(|| Vec3::new(0.35, 0.82, 0.45)),
-        ),
-        channel: key.and_then(|index| lights[index].channel),
-    });
+    if let Some(index) = key {
+        views.push(LightView {
+            source: LightSource::Directional(lights[index].direction_to_light),
+            channel: lights[index].channel,
+            key: true,
+        });
+    }
     views
 }
 
@@ -785,13 +804,6 @@ fn dom_signature(
         }
     }
     Some(signature)
-}
-
-fn key_index(lights: &[ExtractedDirectional]) -> Option<usize> {
-    lights
-        .iter()
-        .position(|light| light.casts_shadows)
-        .or((!lights.is_empty()).then_some(0))
 }
 
 fn world_corners(gpu: &GpuGroom, world_from_model: Mat4) -> [Vec3; 8] {
@@ -840,6 +852,20 @@ impl LightFit {
     fn extinction(&self, groom: &ExtractedGroom) -> f32 {
         let scale = groom.world_from_model.determinant().abs().cbrt();
         groom.fiber_width * scale / (self.texel * DOM_COVERAGE)
+    }
+
+    fn shadow_light(&self, groom: &ExtractedGroom) -> ShadowLight {
+        ShadowLight {
+            light_clip_from_world: self.clip.to_cols_array_2d(),
+            light_eye: self.eye.extend(1.0).to_array(),
+            light_forward: self.forward.extend(0.0).to_array(),
+            depth: [
+                self.near,
+                self.far,
+                self.extinction(groom),
+                if self.perspective { 2.0 } else { 1.0 },
+            ],
+        }
     }
 }
 
@@ -953,9 +979,9 @@ fn render_dom(
         light_forward: fit.forward,
         dom_near: fit.near,
         dom_far: fit.far,
-        dom_scale: (fit.far - fit.near) / LAYER_COUNT as f32,
         dom_extinction: fit.extinction(groom),
         dom_perspective: fit.perspective,
+        has_key: true,
         pass_mode: [1, gpu.bundle_count, u32::from(reverse), 1],
         light_eye: fit.eye,
         rect: [0, 0, DOM_SIZE, DOM_SIZE],
@@ -1233,6 +1259,8 @@ struct RasterBuffers<'a> {
 struct ShadeBuffers<'a> {
     params: &'a Buffer,
     targets: &'a ScreenTargets,
+    channel_dom: &'a Buffer,
+    lights: &'a Buffer,
 }
 
 struct ShadeDraw<'a> {
@@ -1253,7 +1281,13 @@ fn draw_shade(ctx: &mut RenderContext, cache: &PipelineCache, draw: ShadeDraw<'_
         environment_map,
         shade_view,
         rect,
-        buffers: ShadeBuffers { params, targets },
+        buffers:
+            ShadeBuffers {
+                params,
+                targets,
+                channel_dom,
+                lights,
+            },
     } = draw;
     let hair = ctx.render_device().create_bind_group(
         None,
@@ -1265,6 +1299,8 @@ fn draw_shade(ctx: &mut RenderContext, cache: &PipelineCache, draw: ShadeDraw<'_
             targets.shaded.as_entire_binding(),
             targets.shaded_depth.as_entire_binding(),
             targets.dom.as_entire_binding(),
+            channel_dom.as_entire_binding(),
+            lights.as_entire_binding(),
         )),
     );
     let color_attachment = [Some(RenderPassColorAttachment {
@@ -1361,6 +1397,11 @@ mod dom_layout {
         assert!(clear.contains(&size), "{size} missing from clear_dom.wgsl");
         let receiver = include_str!("shaders/hair_shadow.wesl");
         let channels = format!("const CHANNELS: u32 = {}u;", super::SHADOW_CHANNELS);
+        let shade_channels = format!("const SHADOW_CHANNELS: u32 = {}u;", super::SHADOW_CHANNELS);
+        assert!(
+            common.contains(&shade_channels),
+            "{shade_channels} missing from common.wgsl"
+        );
         assert!(
             receiver.contains(&channels),
             "{channels} missing from hair_shadow.wesl"

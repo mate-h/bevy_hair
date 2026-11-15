@@ -6,6 +6,8 @@ use bevy::render::render_resource::binding_types::{
     storage_buffer_read_only_sized, storage_buffer_sized, texture_depth_2d, uniform_buffer_sized,
 };
 use bevy::render::render_resource::*;
+
+use crate::render::pass::{SHADOW_CHANNELS, SHADOW_LIGHT_BYTES};
 const COMMON: &str = include_str!("shaders/common.wgsl");
 
 /// `HairParams` uniform size. Keep in sync with `shaders/common.wgsl`.
@@ -137,7 +139,19 @@ pub fn init_pipelines(
         "hair_shade",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::FRAGMENT,
-            (params_uniform(), ro(8), ro(4), rw(16), rw(4), ro(4)),
+            (
+                params_uniform(),
+                ro(8),
+                ro(4),
+                rw(16),
+                rw(4),
+                ro(4),
+                ro(4),
+                uniform_buffer_sized(
+                    false,
+                    NonZeroU64::new(SHADOW_LIGHT_BYTES * SHADOW_CHANNELS as u64),
+                ),
+            ),
         ),
     );
     let filter_layout = BindGroupLayoutDescriptor::new(

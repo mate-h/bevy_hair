@@ -25,12 +25,27 @@ struct HairParams {
     // x: 0 camera raster, 1 opacity-map depth, 2 opacity-map layers.
     pass_mode: vec4<u32>,
     // Deep opacity map light view. Not a copy of the clustered light list.
+    // `light_eye.w` is 1 when the key directional has a map, `light_forward.w`
+    // 1 when that map is perspective.
     light_eye: vec4<f32>,
     light_forward: vec4<f32>,
     dom_info: vec4<f32>,
     // Camera passes: the groom's screen rectangle, [x0, y0, x1, y1).
     rect: vec4<u32>,
 }
+
+// A deep opacity map's light view. Mirrors `ShadowLight` in pass.rs.
+struct ShadowLight {
+    light_clip_from_world: mat4x4<f32>,
+    light_eye: vec4<f32>,
+    light_forward: vec4<f32>,
+    // x near, y far, z extinction per `DOM_COVERAGE` unit (over light depth
+    // when perspective), w 0 without a map, 1 orthographic, 2 perspective.
+    depth: vec4<f32>,
+}
+
+// Keep in sync with `MAX_MATERIAL_SHADOW_CHANNELS` in Bevy.
+const SHADOW_CHANNELS: u32 = 4u;
 
 struct BundleInfo {
     layer_offset: u32,

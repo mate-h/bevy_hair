@@ -6,6 +6,10 @@ import bevy_pbr::render::{
     mesh_view_types::{
         DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT, POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT,
         POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE,
+        POINT_LIGHT_FLAGS_MATERIAL_SHADOW_CHANNEL_SHIFT,
+        POINT_LIGHT_FLAGS_MATERIAL_SHADOW_CHANNEL_MASK,
+        DIRECTIONAL_LIGHT_FLAGS_MATERIAL_SHADOW_CHANNEL_SHIFT,
+        DIRECTIONAL_LIGHT_FLAGS_MATERIAL_SHADOW_CHANNEL_MASK,
     },
     shadows::{fetch_directional_shadow, fetch_point_shadow, fetch_spot_shadow},
 };
@@ -16,6 +20,10 @@ import bevy_pbr::render::{
 @group(2) @binding(3) var<storage, read_write> shaded: array<vec4<f32>>;
 @group(2) @binding(4) var<storage, read_write> shaded_depth: array<f32>;
 @group(2) @binding(5) var<storage, read> dom: array<u32>;
+// Every material shadow channel's map, as `HairShadow` publishes them.
+@group(2) @binding(6) var<storage, read> channel_dom: array<u32>;
+// This groom's view for each channel. `depth.w` is 0 where it has no map.
+@group(2) @binding(7) var<uniform> shade_lights: array<ShadowLight, SHADOW_CHANNELS>;
 
 const IOR: f32 = 1.55;
 
@@ -243,15 +251,64 @@ fn hair_bsdf(
     return color * shadow;
 }
 
-// Optical depth per `DOM_COVERAGE` unit at light depth `z`: fiber width over
-// texel width. A perspective map's texels widen with depth.
-fn dom_extinction(z: f32) -> f32 {
-    let k = params.filter_params.w;
-    return select(k, k / max(z, 1e-3), params.light_forward.w > 0.5);
+// A deep opacity map to look up: the key directional's in `dom`, or a
+// material shadow channel's in `channel_dom`.
+struct DomView {
+    clip: mat4x4<f32>,
+    eye: vec3<f32>,
+    forward: vec3<f32>,
+    near: f32,
+    far: f32,
+    // Optical depth per `DOM_COVERAGE` unit, over light depth when perspective.
+    extinction: f32,
+    perspective: bool,
+    // 0 for `dom`, else the channel + 1.
+    source: u32,
+}
+
+fn key_view() -> DomView {
+    return DomView(
+        params.light_clip_from_world,
+        params.light_eye.xyz,
+        params.light_forward.xyz,
+        params.dom_info.z,
+        params.dom_info.w,
+        params.filter_params.w,
+        params.light_forward.w > 0.5,
+        0u,
+    );
+}
+
+fn channel_view(channel: u32) -> DomView {
+    let light = shade_lights[channel];
+    return DomView(
+        light.light_clip_from_world,
+        light.light_eye.xyz,
+        light.light_forward.xyz,
+        light.depth.x,
+        light.depth.y,
+        light.depth.z,
+        light.depth.w > 1.5,
+        channel + 1u,
+    );
+}
+
+fn dom_word(view: DomView, i: u32) -> u32 {
+    if view.source == 0u {
+        return dom[i];
+    }
+    let words = u32(params.dom_info.x) * u32(params.dom_info.y) * (1u + DOM_LAYERS);
+    return channel_dom[(view.source - 1u) * words + i];
+}
+
+// Fiber width over texel width at light depth `z`. A perspective map's texels
+// widen with depth.
+fn dom_extinction(view: DomView, z: f32) -> f32 {
+    return select(view.extinction, view.extinction / max(z, 1e-3), view.perspective);
 }
 
 // Expected fibers crossed between the front of the texel and `t` slices in.
-fn dom_optical_depth(pix: u32, t: f32, z_front: f32, thickness: f32) -> f32 {
+fn dom_optical_depth(view: DomView, pix: u32, t: f32, z_front: f32, thickness: f32) -> f32 {
     let pixels = u32(params.dom_info.x) * u32(params.dom_info.y);
     let base = pixels + pix * DOM_LAYERS;
     var occ = 0.0;
@@ -260,60 +317,68 @@ fn dom_optical_depth(pix: u32, t: f32, z_front: f32, thickness: f32) -> f32 {
         let fill = clamp(t - i, 0.0, 1.0);
         if fill > 0.0 {
             let z = z_front + (i + 0.5) * thickness;
-            occ += f32(dom[base + slice]) * fill * dom_extinction(z);
+            occ += f32(dom_word(view, base + slice)) * fill * dom_extinction(view, z);
         }
     }
     return occ;
 }
 
-fn dom_texel_visibility(x: i32, y: i32, dist: f32, near: f32, far: f32, dom_w: u32, dom_h: u32) -> f32 {
+fn dom_texel_visibility(view: DomView, x: i32, y: i32, dist: f32) -> f32 {
+    let dom_w = u32(params.dom_info.x);
+    let dom_h = u32(params.dom_info.y);
     if x < 0 || y < 0 || x >= i32(dom_w) || y >= i32(dom_h) {
         return 1.0;
     }
     let pix = u32(y) * dom_w + u32(x);
-    let front_q = dom[pix];
+    let front_q = dom_word(view, pix);
     if front_q == DOM_EMPTY {
         return 1.0;
     }
-    let z_front = dequantize_depth(front_q, near, far);
-    let thickness = max(far - near, 1e-3) / f32(DOM_LAYERS);
+    let z_front = dequantize_depth(front_q, view.near, view.far);
+    let thickness = max(view.far - view.near, 1e-3) / f32(DOM_LAYERS);
     // A small slack keeps the front surface from reading the opacity it just
     // wrote when reconstruction sits a fraction of a layer behind the map.
     let rel = max(dist - z_front - thickness * 0.05, 0.0);
-    return exp(-dom_optical_depth(pix, rel / thickness, z_front, thickness));
+    return exp(-dom_optical_depth(view, pix, rel / thickness, z_front, thickness));
 }
 
-fn dom_visibility(world: vec3<f32>, beta: f32) -> f32 {
-    if params.flags.w == 0u {
-        return 1.0;
-    }
-    let clip = params.light_clip_from_world * vec4<f32>(world, 1.0);
+// Optical depth of hair between `world` and the light `view` looks from.
+fn dom_depth(view: DomView, world: vec3<f32>, beta: f32) -> f32 {
+    let clip = view.clip * vec4<f32>(world, 1.0);
     if clip.w <= 0.0 {
-        return 1.0;
+        return 0.0;
     }
     let ndc = clip.xy / clip.w;
     let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 1.0 - (ndc.y * 0.5 + 0.5));
     if uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0 {
-        return 1.0;
+        return 0.0;
     }
-    let dom_w = u32(params.dom_info.x);
-    let dom_h = u32(params.dom_info.y);
-    let near = params.dom_info.z;
-    let far = params.dom_info.w;
     // Eq. 8. `-log(β)` hair-mesh layers toward the light.
-    let dist = dot(world - params.light_eye.xyz, params.light_forward.xyz)
-        - (-log(max(beta, 1e-4)) * params.filter_params.z);
-    let fx = uv.x * f32(dom_w) - 0.5;
-    let fy = uv.y * f32(dom_h) - 0.5;
-    let x0 = i32(floor(fx));
-    let y0 = i32(floor(fy));
-    let tx = fract(fx);
-    let ty = fract(fy);
-    let v00 = dom_texel_visibility(x0, y0, dist, near, far, dom_w, dom_h);
-    let v10 = dom_texel_visibility(x0 + 1, y0, dist, near, far, dom_w, dom_h);
-    let v01 = dom_texel_visibility(x0, y0 + 1, dist, near, far, dom_w, dom_h);
-    let v11 = dom_texel_visibility(x0 + 1, y0 + 1, dist, near, far, dom_w, dom_h);
-    return mix(mix(v00, v10, tx), mix(v01, v11, tx), ty);
+    let layer = (view.far - view.near) / f32(LAYER_COUNT);
+    let dist = dot(world - view.eye, view.forward) + log(max(beta, 1e-4)) * layer;
+    let f = uv * params.dom_info.xy - 0.5;
+    let x0 = i32(floor(f.x));
+    let y0 = i32(floor(f.y));
+    let w = fract(f);
+    let v00 = dom_texel_visibility(view, x0, y0, dist);
+    let v10 = dom_texel_visibility(view, x0 + 1, y0, dist);
+    let v01 = dom_texel_visibility(view, x0, y0 + 1, dist);
+    let v11 = dom_texel_visibility(view, x0 + 1, y0 + 1, dist);
+    let visibility = mix(mix(v00, v10, w.x), mix(v01, v11, w.x), w.y);
+    return -log(max(visibility, 1e-6));
+}
+
+// Hair in front of the fiber scatters rather than blocks, so a light's deep
+// opacity map feeds the BSDF an optical depth instead of a shadow. `channel` is
+// the light's material shadow channel + 1, or 0 without one.
+fn channel_depth(channel: u32, world: vec3<f32>, beta: f32) -> f32 {
+    if params.flags.w == 0u || channel == 0u || channel > SHADOW_CHANNELS {
+        return 0.0;
+    }
+    if shade_lights[channel - 1u].depth.w == 0.0 {
+        return 0.0;
+    }
+    return dom_depth(channel_view(channel - 1u), world, beta);
 }
 
 fn spot_mask(light_id: u32, world: vec3<f32>) -> f32 {
@@ -467,7 +532,10 @@ fn direct_light(
         if ((*light).flags & POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u {
             shadow = fetch_point_shadow(light_id, world_h, fiber_n, frag_xy);
         }
-        let lobe = hair_bsdf(tangent, view, incident, sigma_a, shape, ds, shadow, 0.0);
+        let channel = ((*light).flags >> POINT_LIGHT_FLAGS_MATERIAL_SHADOW_CHANNEL_SHIFT)
+            & POINT_LIGHT_FLAGS_MATERIAL_SHADOW_CHANNEL_MASK;
+        let depth = channel_depth(channel, world, beta);
+        let lobe = hair_bsdf(tangent, view, incident, sigma_a, shape, ds, shadow, depth);
         color += lobe * (*light).color_inverse_square_range.rgb * attenuation;
     }
 
@@ -482,11 +550,15 @@ fn direct_light(
         if ((*light).flags & POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u {
             shadow = fetch_spot_shadow(light_id, world_h, fiber_n, (*light).shadow_map_near_z, frag_xy);
         }
-        let lobe = hair_bsdf(tangent, view, incident, sigma_a, shape, ds, shadow, 0.0);
+        let channel = ((*light).flags >> POINT_LIGHT_FLAGS_MATERIAL_SHADOW_CHANNEL_SHIFT)
+            & POINT_LIGHT_FLAGS_MATERIAL_SHADOW_CHANNEL_MASK;
+        let depth = channel_depth(channel, world, beta);
+        let lobe = hair_bsdf(tangent, view, incident, sigma_a, shape, ds, shadow, depth);
         color += lobe * (*light).color_inverse_square_range.rgb * attenuation * spot_mask(light_id, world);
     }
 
-    var dom_left = true;
+    // The key map belongs to the shadowed directional it was rendered for.
+    let has_key = params.flags.w != 0u && params.light_eye.w > 0.5;
     let n_directional = view_bindings::lights.n_directional_lights;
     for (var i = 0u; i < n_directional; i++) {
         let light = &view_bindings::lights.directional_lights[i];
@@ -496,12 +568,11 @@ fn direct_light(
         if casts {
             shadow = fetch_directional_shadow(i, world_h, fiber_n, view_z, frag_xy);
         }
-        // Hair in front of the fiber scatters rather than blocks, so the deep
-        // opacity map feeds the BSDF an optical depth instead of a shadow.
-        var depth = 0.0;
-        if dom_left && casts {
-            depth = -log(max(dom_visibility(world, beta), 1e-6));
-            dom_left = false;
+        let channel = ((*light).flags >> DIRECTIONAL_LIGHT_FLAGS_MATERIAL_SHADOW_CHANNEL_SHIFT)
+            & DIRECTIONAL_LIGHT_FLAGS_MATERIAL_SHADOW_CHANNEL_MASK;
+        var depth = channel_depth(channel, world, beta);
+        if channel == 0u && has_key && casts && dot(incident, params.light_forward.xyz) < -0.9999 {
+            depth = dom_depth(key_view(), world, beta);
         }
         let lobe = hair_bsdf(tangent, view, incident, sigma_a, shape, ds, shadow, depth);
         color += lobe * (*light).color.rgb;
