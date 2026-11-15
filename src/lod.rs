@@ -18,16 +18,19 @@ pub fn strand_count_lod(l: f32, strand_count: u32, delta: f32, culled: bool) -> 
     raw.clamp(1.0, n) as u32
 }
 
-/// Eqs. 4–5. `c_layers` is the hard lower bound on `C_raw` before the power-of-two snap.
+/// The most control points a strand gets. The bake resamples strands to
+/// `LAYER_COUNT` points and `STYLE_W` style slices, so more add segments, not
+/// detail. Keep in sync with `MAX_CONTROL_POINTS` in `common.wgsl`.
+pub const MAX_CONTROL_POINTS: u32 = 65;
+
+/// Eqs. 4–5. `layer_count` is the hard lower bound on `C_raw`. Eq. 5 snaps down
+/// to `2^k + 1`, which takes a floor of 16 to 9; this snaps up, so the count never
+/// falls below the layers. `control_points_for_lod` in `common.wgsl` follows this.
 pub fn control_point_count(l: f32, layer_count: u32) -> u32 {
-    const C_MAX: f32 = 127.0;
     let l = l.clamp(0.0, 1.0);
-    let c_raw = (l.sqrt() * C_MAX).floor().max(layer_count as f32);
-    if c_raw < 3.0 {
-        return c_raw.max(2.0) as u32;
-    }
-    let snapped = 2.0f32.powf((c_raw - 1.0).log2().floor()) + 1.0;
-    snapped.min(C_MAX) as u32
+    let scaled = (l.sqrt() * MAX_CONTROL_POINTS as f32).floor() as u32;
+    let c_raw = scaled.max(layer_count).max(3);
+    ((c_raw - 1).next_power_of_two() + 1).min(MAX_CONTROL_POINTS)
 }
 
 /// Eq. 8. Unitless optical-depth shift toward the light. The shader multiplies this
@@ -90,19 +93,25 @@ mod tests {
     }
 
     #[test]
-    fn control_points_snap_to_power_of_two_plus_one() {
-        let full = control_point_count(1.0, 16);
-        assert!(full >= 3);
-        assert_eq!(
-            (full - 1).count_ones(),
-            1,
-            "C-1 is a power of two, got {full}"
-        );
-        assert!(full <= 127);
-        let low = control_point_count(0.0, 16);
-        // C_raw is at least the layer count, then snapped.
-        assert!(low >= 3);
-        assert_eq!((low - 1).count_ones(), 1);
+    fn control_points_snap_up_to_power_of_two_plus_one() {
+        let mut last = 0;
+        for step in 0..=1000 {
+            let c = control_point_count(step as f32 / 1000.0, 16);
+            assert_eq!((c - 1).count_ones(), 1, "C-1 is a power of two, got {c}");
+            assert!(c >= 17, "never below the 16 layers, got {c}");
+            assert!(c <= MAX_CONTROL_POINTS);
+            assert!(c >= last, "monotonic in L");
+            last = c;
+        }
+        assert_eq!(control_point_count(0.0, 16), 17);
+        assert_eq!(control_point_count(1.0, 16), MAX_CONTROL_POINTS);
+    }
+
+    #[test]
+    fn shader_cap_matches() {
+        let common = include_str!("render/shaders/common.wgsl");
+        let cap = format!("const MAX_CONTROL_POINTS: u32 = {MAX_CONTROL_POINTS}u;");
+        assert!(common.contains(&cap), "{cap} missing from common.wgsl");
     }
 
     #[test]

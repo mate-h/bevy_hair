@@ -251,13 +251,19 @@ fn reconstruct_world(params: HairParams, pixel: vec2<i32>, view_dist: f32) -> ve
     return params.camera_pos.xyz + dir * (view_dist / denom);
 }
 
+// The bake resamples strands to `LAYER_COUNT` points and `STYLE_W` style
+// slices, so control points past 65 add segments, not detail. Keep in sync
+// with `MAX_CONTROL_POINTS` in lod.rs.
+const MAX_CONTROL_POINTS: u32 = 65u;
+
+// Eqs. 4–5, snapped up to 2^k + 1. Eq. 5 rounds down, which takes the layer
+// floor of 16 to 9 control points. Mirrors `control_point_count` in lod.rs.
 fn control_points_for_lod(l: f32) -> u32 {
-    let c_raw = max(floor(sqrt(clamp(l, 0.0, 1.0)) * 127.0), f32(LAYER_COUNT));
-    if c_raw < 3.0 {
-        return u32(max(c_raw, 2.0));
-    }
-    let snapped = pow(2.0, floor(log2(c_raw - 1.0))) + 1.0;
-    return u32(min(snapped, 127.0));
+    let scaled = u32(floor(sqrt(clamp(l, 0.0, 1.0)) * f32(MAX_CONTROL_POINTS)));
+    let c_raw = max(max(scaled, LAYER_COUNT), 3u);
+    // The smallest power of two at or above c_raw - 1.
+    let span = 1u << (firstLeadingBit(c_raw - 2u) + 1u);
+    return min(span + 1u, MAX_CONTROL_POINTS);
 }
 
 fn style_index(offset: u32, u: u32, v: u32, w: u32) -> u32 {

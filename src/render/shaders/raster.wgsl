@@ -236,48 +236,26 @@ fn draw_segment(p0: vec3<f32>, p1: vec3<f32>, t0: vec3<f32>, t1: vec3<f32>, uvw0
 fn main(
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(local_invocation_index) lane: u32,
-    @builtin(subgroup_size) subgroup_size: u32,
 ) {
     let strand = refs[wg.x];
     let bundle = bundles[strand.bundle];
     let uv = pcg_uv(strand.strand ^ (strand.bundle * 0x85ebca6bu));
-    let use_shuffle = subgroup_size == 32u;
 
-    var loaded = vec4<f32>(0.0);
+    // Neighbors come from shared memory after each barrier. Subgroup shuffles
+    // would assume the subgroup is the workgroup, which WGSL does not promise.
     if lane < LAYER_COUNT {
-        let sample = sample_layer(bundle.layer_offset, lane, uv);
-        loaded = sample.pos_ao;
-        sm[lane] = sample;
-    }
-    var prev_l = loaded;
-    var next_l = loaded;
-    if use_shuffle {
-        prev_l = subgroupShuffleUp(loaded, 1u);
-        next_l = subgroupShuffleDown(loaded, 1u);
+        sm[lane] = sample_layer(bundle.layer_offset, lane, uv);
     }
     workgroupBarrier();
     if lane < LAYER_COUNT {
-        var prev_p = prev_l.xyz;
-        var next_p = next_l.xyz;
-        if !use_shuffle {
-            let prev_i = select(lane - 1u, 0u, lane == 0u);
-            let next_i = min(lane + 1u, LAYER_COUNT - 1u);
-            prev_p = sm[prev_i].pos_ao.xyz;
-            next_p = sm[next_i].pos_ao.xyz;
-        }
-        if lane == 0u {
-            prev_p = loaded.xyz;
-        }
-        if lane + 1u >= LAYER_COUNT {
-            next_p = loaded.xyz;
-        }
-        let tangent = calc_tangent(lane, LAYER_COUNT, prev_p, loaded.xyz, next_p);
-        sm[lane].pos_ao = loaded;
+        let prev_p = sm[select(lane - 1u, 0u, lane == 0u)].pos_ao.xyz;
+        let next_p = sm[min(lane + 1u, LAYER_COUNT - 1u)].pos_ao.xyz;
+        let tangent = calc_tangent(lane, LAYER_COUNT, prev_p, sm[lane].pos_ao.xyz, next_p);
         sm[lane].tangent = vec4<f32>(tangent, 0.0);
     }
     workgroupBarrier();
 
-    let ncp = clamp(strand.control_points, 2u, 127u);
+    let ncp = clamp(strand.control_points, 2u, MAX_CONTROL_POINTS);
     // Points per lane. ceil((ncp - 1) / 32) covers segments only, and LOD
     // counts are 2^k+1, so the tip stayed zero and the last segment hit the origin.
     let s = max((ncp + 31u) / 32u, 1u);
@@ -293,14 +271,6 @@ fn main(
     }
     workgroupBarrier();
 
-    let owned_first = cp_pos[min(first, ncp - 1u)];
-    let owned_last = cp_pos[min(first + s - 1u, ncp - 1u)];
-    var prev_last = owned_first;
-    var next_first = owned_last;
-    if use_shuffle {
-        prev_last = subgroupShuffleUp(owned_last, 1u);
-        next_first = subgroupShuffleDown(owned_first, 1u);
-    }
     for (var k = 0u; k < 4u; k++) {
         if k >= s {
             break;
@@ -314,12 +284,6 @@ fn main(
             }
             if idx + 1u < ncp {
                 next_p = cp_pos[idx + 1u].xyz;
-            }
-            if use_shuffle && idx == first && lane > 0u && idx > 0u {
-                prev_p = prev_last.xyz;
-            }
-            if use_shuffle && k + 1u == s && idx + 1u < ncp {
-                next_p = next_first.xyz;
             }
             cp_tan[idx] = vec4<f32>(safe_normalize(calc_tangent(idx, ncp, prev_p, cp_pos[idx].xyz, next_p)), 0.0);
         }

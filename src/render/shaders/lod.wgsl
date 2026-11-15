@@ -43,7 +43,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             cps = control_points_for_lod(1.0);
         } else if params.flags.x == 0u {
             n_lod = bundle.strand_count;
-            cps = 127u;
+            cps = MAX_CONTROL_POINTS;
         } else {
             let diag = length(aabb_max - aabb_min);
             let l = clamp(diag / max(params.screen.y, 1.0) * params.appearance.z, 0.0, 1.0);
