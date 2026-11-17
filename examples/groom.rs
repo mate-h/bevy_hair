@@ -25,6 +25,7 @@ use bevy::prelude::*;
 use bevy::render::RenderPlugin;
 use bevy::render::render_resource::{TextureUsages, WgpuFeatures};
 use bevy::render::settings::WgpuSettings;
+use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy_camera_controller::free_camera::{
     FreeCamera, FreeCameraPlugin, run_freecamera_controller,
 };
@@ -72,7 +73,42 @@ fn main() {
             Update,
             (controls, draw_cages, apply_rig, spin_environment).chain(),
         )
+        .add_systems(Update, screenshot_and_exit)
         .run();
+}
+
+/// `HAIR_SCREENSHOT=<file.png>` saves one frame after `HAIR_SCREENSHOT_SECS`
+/// (default 40, past pipeline compilation) and quits. The default scene is
+/// static, so two runs of one build give the same image.
+fn screenshot_and_exit(
+    mut commands: Commands,
+    time: Res<Time<Real>>,
+    mut state: Local<Option<f32>>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let Ok(path) = std::env::var("HAIR_SCREENSHOT") else {
+        return;
+    };
+    let now = time.elapsed_secs();
+    match *state {
+        None => {
+            let after = std::env::var("HAIR_SCREENSHOT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(40.0);
+            if now >= after {
+                commands
+                    .spawn(Screenshot::primary_window())
+                    .observe(save_to_disk(path));
+                *state = Some(now);
+            }
+        }
+        // Give the readback a moment to land on disk.
+        Some(taken) if now - taken > 2.0 => {
+            exit.write(AppExit::Success);
+        }
+        Some(_) => {}
+    }
 }
 
 struct GroomControls;

@@ -74,47 +74,59 @@ fn eval_cp(idx: u32, ncp: u32, uv: vec2<f32>, style_offset: u32) -> vec4<f32> {
     return vec4<f32>(base + residual, ao);
 }
 
-fn write_pixel(pixel: vec2<i32>, t: f32, p0: vec3<f32>, p1: vec3<f32>, t0: vec3<f32>, t1: vec3<f32>, uvw0: vec3<f32>, uvw1: vec3<f32>, ao0: f32, ao1: f32, center_hit: bool, beta: f32) {
-    let width = i32(params.screen.x);
-    let height = i32(params.screen.y);
-    // Outside the rectangle the G-buffer is not cleared.
-    let rect = vec4<i32>(params.rect);
-    if any(pixel < rect.xy) || any(pixel >= rect.zw) {
-        return;
-    }
+// The G-buffer word for one step of a segment. A step's corner pixels reuse
+// the same t, so only the rect check and the scene depth test differ per pixel.
+struct GbSample {
+    // Complemented, so buffers clear to zero (see `unpack_gb`).
+    payload: u64,
+    beta_word: u32,
+    clip_depth: f32,
+    valid: bool,
+}
+
+fn encode_sample(t: f32, p0: vec3<f32>, p1: vec3<f32>, t0: vec3<f32>, t1: vec3<f32>, uvw0: vec3<f32>, uvw1: vec3<f32>, ao0: f32, ao1: f32, beta_q: u32) -> GbSample {
+    var s: GbSample;
     let world = mix(p0, p1, t);
+    let dist = dot(world - params.camera_pos.xyz, params.camera_forward.xyz);
+    s.valid = dist > params.screen.z;
+    if !s.valid {
+        return s;
+    }
+    let clip = params.clip_from_world * vec4<f32>(world, 1.0);
+    s.clip_depth = clip.z / max(clip.w, 1e-5);
     let tangent = safe_normalize(mix(t0, t1, t));
     let uvw = mix(uvw0, uvw1, t);
     let ao = mix(ao0, ao1, t);
-    let dist = dot(world - params.camera_pos.xyz, params.camera_forward.xyz);
-    if dist <= params.screen.z {
-        return;
-    }
-    let clip = params.clip_from_world * vec4<f32>(world, 1.0);
-    let clip_depth = clip.z / max(clip.w, 1e-5);
-    let scene = textureLoad(scene_depth, pixel, 0);
-    if params.pass_mode.z == 1u {
-        if clip_depth < scene {
-            return;
-        }
-    } else if clip_depth > scene {
-        return;
-    }
-
     let depth = quantize_depth(dist, params.screen.z, params.screen.w);
     let oct = oct_encode(tangent);
     var ao_q = u32(clamp(ao, 0.0, 1.0) * 63.0 + 0.5);
     if params.flags.z == 0u {
         ao_q = 63u;
     }
-    let payload = pack_gb(depth, oct.x, oct.y, quant_uvw(uvw), ao_q);
-    let pix = u32(pixel.y) * u32(width) + u32(pixel.x);
-    // Complements, so buffers clear to zero (see `unpack_gb`).
-    atomicMax(&conservative[pix], ~payload);
+    s.payload = ~pack_gb(depth, oct.x, oct.y, quant_uvw(uvw), ao_q);
+    s.beta_word = ~((depth << 8u) | beta_q);
+    return s;
+}
+
+fn write_pixel(pixel: vec2<i32>, s: GbSample, center_hit: bool) {
+    // Outside the rectangle the G-buffer is not cleared.
+    let rect = vec4<i32>(params.rect);
+    if any(pixel < rect.xy) || any(pixel >= rect.zw) {
+        return;
+    }
+    let scene = textureLoad(scene_depth, pixel, 0);
+    if params.pass_mode.z == 1u {
+        if s.clip_depth < scene {
+            return;
+        }
+    } else if s.clip_depth > scene {
+        return;
+    }
+    let pix = u32(pixel.y) * u32(params.screen.x) + u32(pixel.x);
+    atomicMax(&conservative[pix], s.payload);
     if center_hit {
-        atomicMax(&center[pix], ~payload);
-        let beta_q = u32(clamp(beta, 0.0, 1.0) * 255.0 + 0.5);
-        atomicMax(&beta_buf[pix], ~((depth << 8u) | beta_q));
+        atomicMax(&center[pix], s.payload);
+        atomicMax(&beta_buf[pix], s.beta_word);
     }
 }
 
@@ -209,23 +221,26 @@ fn draw_segment(p0: vec3<f32>, p1: vec3<f32>, t0: vec3<f32>, t1: vec3<f32>, uvw0
     let steps = i32(ceil(max(abs(delta.x), abs(delta.y))));
     let n = clamp(steps, 1, 96);
     let diameter = max(params.appearance.w, 0.05);
+    let seg = b.screen - a.screen;
+    let denom = max(dot(seg, seg), 1e-6);
+    let beta_q = u32(clamp(beta, 0.0, 1.0) * 255.0 + 0.5);
     var prev = a.screen;
     for (var i = 0; i <= n; i++) {
         let t = f32(i) / f32(n);
         let screen = mix(a.screen, b.screen, t);
         let pix = vec2<i32>(floor(screen));
-        let center = vec2<f32>(pix) + 0.5;
-        let seg = b.screen - a.screen;
-        let denom = max(dot(seg, seg), 1e-6);
-        let closest = clamp(dot(center - a.screen, seg) / denom, 0.0, 1.0);
-        let dist = length(center - (a.screen + seg * closest));
-        let center_hit = dist <= diameter * 0.5;
-        write_pixel(pix, t, p0, p1, t0, t1, uvw0, uvw1, ao0, ao1, center_hit, beta);
-        if i > 0 {
-            let prev_pix = vec2<i32>(floor(prev));
-            if prev_pix.x != pix.x && prev_pix.y != pix.y {
-                write_pixel(vec2<i32>(prev_pix.x, pix.y), t, p0, p1, t0, t1, uvw0, uvw1, ao0, ao1, false, beta);
-                write_pixel(vec2<i32>(pix.x, prev_pix.y), t, p0, p1, t0, t1, uvw0, uvw1, ao0, ao1, false, beta);
+        let s = encode_sample(t, p0, p1, t0, t1, uvw0, uvw1, ao0, ao1, beta_q);
+        if s.valid {
+            let center = vec2<f32>(pix) + 0.5;
+            let closest = clamp(dot(center - a.screen, seg) / denom, 0.0, 1.0);
+            let dist = length(center - (a.screen + seg * closest));
+            write_pixel(pix, s, dist <= diameter * 0.5);
+            if i > 0 {
+                let prev_pix = vec2<i32>(floor(prev));
+                if prev_pix.x != pix.x && prev_pix.y != pix.y {
+                    write_pixel(vec2<i32>(prev_pix.x, pix.y), s, false);
+                    write_pixel(vec2<i32>(pix.x, prev_pix.y), s, false);
+                }
             }
         }
         prev = screen;
