@@ -328,7 +328,7 @@ fn setup(
     // `spin_environment` continues from this yaw.
     let key = focus + (env_yaw * sun_dir) * 120.0;
     commands.insert_resource(EnvTurntable {
-        spinning: false,
+        spinning: std::env::var_os("HAIR_SPIN").is_some(),
         angle: env_angle,
         focus,
         sun_dir,
@@ -354,8 +354,11 @@ fn setup(
     // Studio directions in the opening camera's frame. `right` is screen right.
     let heading = Vec3::new(150.0, 0.0, 40.0).normalize();
     let right = Vec3::Y.cross(heading);
+    // `HAIR_SPIN=1` starts in environment-sun lighting with the turntable on, so
+    // the key's deep opacity map re-renders every frame (for profiling).
+    let spin = std::env::var_os("HAIR_SPIN").is_some();
     commands.insert_resource(LightRig {
-        studio: true,
+        studio: !spin,
         key_dir: (heading * 0.45 - right * 0.8 + Vec3::Y * 0.55).normalize(),
     });
     // Soft cool fill opposite the key. Only the hair shadows it.

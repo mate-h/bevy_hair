@@ -97,8 +97,12 @@ fn main(
     let sigma_par = f32(radius) * s_par;
     let sigma_perp = f32(radius) * s_perp;
     let sigma_c = 0.9;
-    let depth_reject = 1.45e-3;
-    let closer_eps = 5e-4;
+    // Depth tolerances are world distances, fractions of the groom radius
+    // (`filter_params.z`), so they hold as the camera backs off. Compared in
+    // the quantized depth's [near, far] units.
+    let depth_range = max(params.screen.w - params.screen.z, 1e-3);
+    let depth_reject = 0.01345 * params.filter_params.z / depth_range;
+    let closer_eps = 0.004638 * params.filter_params.z / depth_range;
     let strip = 0.5;
 
     var accum = vec3<f32>(0.0);

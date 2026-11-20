@@ -259,9 +259,6 @@ struct DomView {
     forward: vec3<f32>,
     near: f32,
     far: f32,
-    // Optical depth per `DOM_COVERAGE` unit, over light depth when perspective.
-    extinction: f32,
-    perspective: bool,
     // 0 for `dom`, else the channel + 1.
     source: u32,
 }
@@ -273,8 +270,6 @@ fn key_view() -> DomView {
         params.light_forward.xyz,
         params.dom_info.z,
         params.dom_info.w,
-        params.filter_params.w,
-        params.light_forward.w > 0.5,
         0u,
     );
 }
@@ -287,8 +282,6 @@ fn channel_view(channel: u32) -> DomView {
         light.light_forward.xyz,
         light.depth.x,
         light.depth.y,
-        light.depth.z,
-        light.depth.w > 1.5,
         channel + 1u,
     );
 }
@@ -301,26 +294,22 @@ fn dom_word(view: DomView, i: u32) -> u32 {
     return channel_dom[(view.source - 1u) * words + i];
 }
 
-// Fiber width over texel width at light depth `z`. A perspective map's texels
-// widen with depth.
-fn dom_extinction(view: DomView, z: f32) -> f32 {
-    return select(view.extinction, view.extinction / max(z, 1e-3), view.perspective);
-}
-
 // Expected fibers crossed between the front of the texel and `t` slices in.
-fn dom_optical_depth(view: DomView, pix: u32, t: f32, z_front: f32, thickness: f32) -> f32 {
+// Slices hold the running optical depth through their far edge
+// (`dom_prefix.wgsl`), so this interpolates between two words.
+fn dom_optical_depth(view: DomView, pix: u32, t: f32) -> f32 {
     let pixels = u32(params.dom_info.x) * u32(params.dom_info.y);
     let base = pixels + pix * DOM_LAYERS;
-    var occ = 0.0;
-    for (var slice = 0u; slice < DOM_LAYERS; slice++) {
-        let i = f32(slice);
-        let fill = clamp(t - i, 0.0, 1.0);
-        if fill > 0.0 {
-            let z = z_front + (i + 0.5) * thickness;
-            occ += f32(dom_word(view, base + slice)) * fill * dom_extinction(view, z);
-        }
+    if t >= f32(DOM_LAYERS) {
+        return bitcast<f32>(dom_word(view, base + DOM_LAYERS - 1u));
     }
-    return occ;
+    let slice = u32(t);
+    let after = bitcast<f32>(dom_word(view, base + slice));
+    var before = 0.0;
+    if slice > 0u {
+        before = bitcast<f32>(dom_word(view, base + slice - 1u));
+    }
+    return mix(before, after, t - f32(slice));
 }
 
 fn dom_texel_visibility(view: DomView, x: i32, y: i32, dist: f32) -> f32 {
@@ -339,7 +328,7 @@ fn dom_texel_visibility(view: DomView, x: i32, y: i32, dist: f32) -> f32 {
     // A small slack keeps the front surface from reading the opacity it just
     // wrote when reconstruction sits a fraction of a layer behind the map.
     let rel = max(dist - z_front - thickness * 0.05, 0.0);
-    return exp(-dom_optical_depth(view, pix, rel / thickness, z_front, thickness));
+    return exp(-dom_optical_depth(view, pix, rel / thickness));
 }
 
 // Optical depth of hair between `world` and the light `view` looks from.

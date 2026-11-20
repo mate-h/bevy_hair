@@ -36,17 +36,18 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     var n_lod: u32 = 0u;
     var cps: u32 = LAYER_COUNT;
     if !culled {
-        // Deep opacity map: the full strand set at full polyline resolution.
-        // The camera's thinned groom is compensated at lookup time (Eq. 8).
+        let diag = length(aabb_max - aabb_min);
+        let l = clamp(diag / max(params.screen.y, 1.0) * params.appearance.z, 0.0, 1.0);
+        // Deep opacity map: the full strand set, with the polyline resolution its
+        // texel footprint needs (the camera's rule, in map texels). The camera's
+        // thinned groom is compensated at lookup time (Eq. 8).
         if params.pass_mode.w == 1u {
             n_lod = bundle.strand_count;
-            cps = control_points_for_lod(1.0);
+            cps = control_points_for_lod(l);
         } else if params.flags.x == 0u {
             n_lod = bundle.strand_count;
             cps = MAX_CONTROL_POINTS;
         } else {
-            let diag = length(aabb_max - aabb_min);
-            let l = clamp(diag / max(params.screen.y, 1.0) * params.appearance.z, 0.0, 1.0);
             let delta = f32(pcg(bundle_id ^ 0x9e3779b9u)) * (1.0 / 4294967296.0);
             let n = f32(bundle.strand_count);
             let raw = ceil(l * (n + delta));

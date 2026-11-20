@@ -16,6 +16,7 @@ pub const HAIR_PARAMS_SIZE: u64 = 448;
 #[derive(Resource, Clone)]
 pub struct HairShaderHandles {
     pub clear_dom: Handle<Shader>,
+    pub dom_prefix: Handle<Shader>,
     pub lod: Handle<Shader>,
     pub scan: Handle<Shader>,
     pub raster: Handle<Shader>,
@@ -31,6 +32,12 @@ pub fn load_shaders(shaders: &mut Assets<Shader>) -> HairShaderHandles {
             "hair_clear_dom.wgsl",
             include_str!("shaders/clear_dom.wgsl"),
             false,
+        ),
+        dom_prefix: shader(
+            shaders,
+            "hair_dom_prefix.wgsl",
+            include_str!("shaders/dom_prefix.wgsl"),
+            true,
         ),
         lod: shader(
             shaders,
@@ -70,6 +77,8 @@ pub fn load_shaders(shaders: &mut Assets<Shader>) -> HairShaderHandles {
 pub struct HairPipelines {
     pub clear_dom: CachedComputePipelineId,
     pub clear_dom_layout: BindGroupLayoutDescriptor,
+    pub dom_prefix: CachedComputePipelineId,
+    pub dom_prefix_layout: BindGroupLayoutDescriptor,
     pub lod: CachedComputePipelineId,
     pub lod_layout: BindGroupLayoutDescriptor,
     pub scan: CachedComputePipelineId,
@@ -91,6 +100,7 @@ pub fn init_pipelines(
 ) {
     let HairShaderHandles {
         clear_dom,
+        dom_prefix,
         lod,
         scan,
         raster,
@@ -102,6 +112,10 @@ pub fn init_pipelines(
     let clear_dom_layout = BindGroupLayoutDescriptor::new(
         "hair_clear_dom",
         &BindGroupLayoutEntries::sequential(ShaderStages::COMPUTE, (rw(4),)),
+    );
+    let dom_prefix_layout = BindGroupLayoutDescriptor::new(
+        "hair_dom_prefix",
+        &BindGroupLayoutEntries::sequential(ShaderStages::COMPUTE, (params_uniform(), rw(4))),
     );
     let lod_layout = BindGroupLayoutDescriptor::new(
         "hair_lod",
@@ -182,6 +196,8 @@ pub fn init_pipelines(
     let pipelines = HairPipelines {
         clear_dom: queue("hair_clear_dom", &clear_dom_layout, &clear_dom),
         clear_dom_layout,
+        dom_prefix: queue("hair_dom_prefix", &dom_prefix_layout, &dom_prefix),
+        dom_prefix_layout,
         lod: queue("hair_lod", &lod_layout, &lod),
         lod_layout,
         scan: queue("hair_scan", &scan_layout, &scan),
@@ -351,6 +367,10 @@ mod shader_parse {
     #[test]
     fn shaders_parse() {
         parse("clear_dom", include_str!("shaders/clear_dom.wgsl"));
+        parse(
+            "dom_prefix",
+            &with_common(include_str!("shaders/dom_prefix.wgsl")),
+        );
         parse("lod", &with_common(include_str!("shaders/lod.wgsl")));
         parse("scan", &with_common(include_str!("shaders/scan.wgsl")));
         parse("raster", &with_common(include_str!("shaders/raster.wgsl")));

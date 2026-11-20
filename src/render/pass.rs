@@ -333,6 +333,9 @@ pub fn hair_pass(
     let Some(clear_dom) = cache.get_compute_pipeline(pipelines.clear_dom) else {
         return;
     };
+    let Some(dom_prefix) = cache.get_compute_pipeline(pipelines.dom_prefix) else {
+        return;
+    };
     let Some(lod) = cache.get_compute_pipeline(pipelines.lod) else {
         return;
     };
@@ -471,6 +474,7 @@ pub fn hair_pass(
             dom_near: light_near,
             dom_far: light_far,
             dom_extinction: key_fit.as_ref().map_or(0.0, |fit| fit.extinction(groom)),
+            filter_scale: radius,
             dom_perspective: key_fit.as_ref().is_some_and(|fit| fit.perspective),
             has_key: key_fit.is_some(),
             pass_mode: [0, gpu.bundle_count, u32::from(reverse), 0],
@@ -484,6 +488,7 @@ pub fn hair_pass(
             &mut ctx,
             &cache,
             lod,
+            "hair_lod",
             &pipelines.lod_layout,
             BindGroupEntries::sequential((
                 gpu.camera_params.as_entire_binding(),
@@ -497,6 +502,7 @@ pub fn hair_pass(
             &mut ctx,
             &cache,
             scan,
+            "hair_scan",
             &pipelines.scan_layout,
             BindGroupEntries::sequential((
                 gpu.camera_params.as_entire_binding(),
@@ -524,6 +530,7 @@ pub fn hair_pass(
         if groom.deep_opacity && !reuse_doms {
             let dom = DomPasses {
                 clear_dom,
+                dom_prefix,
                 lod,
                 scan,
                 raster,
@@ -601,6 +608,7 @@ pub fn hair_pass(
                 &mut ctx,
                 &cache,
                 filter,
+                "hair_filter",
                 &pipelines.filter_layout,
                 BindGroupEntries::sequential((
                     gpu.camera_params.as_entire_binding(),
@@ -679,6 +687,8 @@ struct ViewArgs<'a> {
     dom_far: f32,
     /// Optical depth per coverage unit, see `LightFit::extinction`.
     dom_extinction: f32,
+    /// World size the filter's depth tolerances scale with: the groom radius.
+    filter_scale: f32,
     dom_perspective: bool,
     /// Whether `light_*` describe a key map for shading.
     has_key: bool,
@@ -702,7 +712,7 @@ fn make_params(args: ViewArgs) -> HairParams {
             args.groom.lambda,
             args.groom.center_diameter,
         ],
-        filter_params: [1.0, 0.2, 0.0, args.dom_extinction],
+        filter_params: [1.0, 0.2, args.filter_scale, args.dom_extinction],
         albedo: args.groom.albedo.to_array(),
         flags: [
             flag(args.groom.lod),
@@ -906,11 +916,33 @@ impl LightSource {
             .to_matrix()
             .inverse();
         let (proj, texel, perspective) = match *self {
-            LightSource::Directional(_) => (
-                bevy::math::proj::orthographic(-radius, radius, -radius, radius, near, far),
-                2.0 * radius / DOM_SIZE as f32,
-                false,
-            ),
+            LightSource::Directional(_) => {
+                // A square around the corners' light-space footprint, so the map
+                // spends its texels on the groom rather than the bounding sphere.
+                let mut lo = Vec2::splat(f32::MAX);
+                let mut hi = Vec2::splat(f32::MIN);
+                for corner in world_corners(gpu, world_from_model) {
+                    let p = view.transform_point3(corner).truncate();
+                    lo = lo.min(p);
+                    hi = hi.max(p);
+                }
+                let mid = (lo + hi) * 0.5;
+                // Two texels of slack for the strands' diagonal fill.
+                let half = (hi - lo).max_element() * 0.5 * (1.0 + 4.0 / DOM_SIZE as f32);
+                let half = half.clamp(1e-3, radius);
+                (
+                    bevy::math::proj::orthographic(
+                        mid.x - half,
+                        mid.x + half,
+                        mid.y - half,
+                        mid.y + half,
+                        near,
+                        far,
+                    ),
+                    2.0 * half / DOM_SIZE as f32,
+                    false,
+                )
+            }
             LightSource::Positional(_) => {
                 let half = (radius / eye.distance(center)).asin();
                 (
@@ -934,6 +966,7 @@ impl LightSource {
 
 struct DomPasses<'a> {
     clear_dom: &'a ComputePipeline,
+    dom_prefix: &'a ComputePipeline,
     lod: &'a ComputePipeline,
     scan: &'a ComputePipeline,
     raster: &'a ComputePipeline,
@@ -945,8 +978,9 @@ struct DomPasses<'a> {
 }
 
 /// Renders the groom's deep opacity map from `fit` into `targets.dom`. Depth
-/// texels, then `DOM_LAYERS` opacity counts. Two rasters: the second bins
-/// fragments relative to the nearest depth from the first.
+/// texels, then `DOM_LAYERS` opacity slices. Two rasters: the second bins
+/// fragments relative to the nearest depth from the first. A last pass turns
+/// the slice counts into running optical depth (f32 bits).
 fn render_dom(
     ctx: &mut RenderContext,
     cache: &PipelineCache,
@@ -958,6 +992,7 @@ fn render_dom(
 ) {
     let DomPasses {
         clear_dom,
+        dom_prefix,
         lod,
         scan,
         raster,
@@ -980,6 +1015,7 @@ fn render_dom(
         dom_near: fit.near,
         dom_far: fit.far,
         dom_extinction: fit.extinction(groom),
+        filter_scale: 0.0,
         dom_perspective: fit.perspective,
         has_key: true,
         pass_mode: [1, gpu.bundle_count, u32::from(reverse), 1],
@@ -1012,6 +1048,7 @@ fn render_dom(
         ctx,
         cache,
         lod,
+        "hair_lod",
         &pipelines.lod_layout,
         BindGroupEntries::sequential((
             params.depth.as_entire_binding(),
@@ -1025,6 +1062,7 @@ fn render_dom(
         ctx,
         cache,
         scan,
+        "hair_scan",
         &pipelines.scan_layout,
         BindGroupEntries::sequential((
             params.depth.as_entire_binding(),
@@ -1050,6 +1088,19 @@ fn render_dom(
             },
         );
     }
+    // Slice counts become running optical depth for O(1) lookups.
+    dispatch(
+        ctx,
+        cache,
+        dom_prefix,
+        "hair_dom_prefix",
+        &pipelines.dom_prefix_layout,
+        BindGroupEntries::sequential((
+            params.opacity.as_entire_binding(),
+            targets.dom.as_entire_binding(),
+        )),
+        ((DOM_SIZE * DOM_SIZE).div_ceil(64), 1, 1),
+    );
 }
 
 /// Strand pixels reach past the projected center line by the diagonal fill.
@@ -1229,6 +1280,7 @@ fn dispatch<const N: usize>(
     ctx: &mut RenderContext,
     cache: &PipelineCache,
     pipeline: &ComputePipeline,
+    label: &str,
     layout: &BindGroupLayoutDescriptor,
     entries: BindGroupEntries<'_, N>,
     groups: (u32, u32, u32),
@@ -1239,7 +1291,7 @@ fn dispatch<const N: usize>(
     let mut pass = ctx
         .command_encoder()
         .begin_compute_pass(&ComputePassDescriptor {
-            label: Some("hair"),
+            label: Some(label),
             ..default()
         });
     pass.set_pipeline(pipeline);

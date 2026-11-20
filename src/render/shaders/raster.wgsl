@@ -286,8 +286,9 @@ fn main(
     }
     workgroupBarrier();
 
+    // Only the G-buffer stores tangents; the opacity passes skip them.
     for (var k = 0u; k < 4u; k++) {
-        if k >= s {
+        if k >= s || params.pass_mode.x != 0u {
             break;
         }
         let idx = first + k;
@@ -306,11 +307,11 @@ fn main(
     workgroupBarrier();
 
     let beta = f32(strand.n_lod) / f32(max(bundle.strand_count, 1u));
-    for (var k = 0u; k < 4u; k++) {
-        if k >= s {
-            break;
-        }
-        let idx = first + k;
+    // Segments go round-robin, so 2^k segments keep every lane busy where the
+    // point split above would leave half of them idle. The G-buffer and opacity
+    // writes are atomic max/min/add, so their order does not matter.
+    for (var k = 0u; k < 2u; k++) {
+        let idx = lane + k * 32u;
         if idx + 1u < ncp {
             let p0 = to_world(params, cp_pos[idx].xyz);
             let p1 = to_world(params, cp_pos[idx + 1u].xyz);

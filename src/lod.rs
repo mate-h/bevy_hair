@@ -46,18 +46,27 @@ pub fn depth_correction(beta: f32) -> f32 {
 /// `t` is the depth past the texel’s front surface, in layers. Completed layers
 /// count fully. The layer that contains the point counts only the fraction in
 /// front of it. Hair at the same depth or behind the point does not count.
-/// `dom_optical_depth` in `shade.wesl` follows this.
+/// The shaders store each slice as the running sum through its far edge
+/// (`dom_prefix.wgsl`) and interpolate between two words, as this does;
+/// `dom_optical_depth` in `shade.wesl` follows it.
 pub fn dom_optical_depth(layers: &[u32], t: f32) -> f32 {
-    let mut occ = 0.0;
-    for (slice, count) in layers.iter().copied().enumerate() {
-        let i = slice as f32;
-        if i + 1.0 <= t {
-            occ += count as f32;
-        } else if i < t {
-            occ += count as f32 * (t - i);
-        }
+    let running: Vec<f32> = layers
+        .iter()
+        .scan(0.0, |occ, &count| {
+            *occ += count as f32;
+            Some(*occ)
+        })
+        .collect();
+    let t = t.max(0.0);
+    let Some(&last) = running.last() else {
+        return 0.0;
+    };
+    if t >= running.len() as f32 {
+        return last;
     }
-    occ
+    let slice = t as usize;
+    let before = if slice > 0 { running[slice - 1] } else { 0.0 };
+    before + (running[slice] - before) * (t - slice as f32)
 }
 
 /// Screen AABB is completely outside the viewport.
