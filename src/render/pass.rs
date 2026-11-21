@@ -66,6 +66,7 @@ struct HairParams {
     light_forward: [f32; 4],
     dom_info: [f32; 4],
     rect: [u32; 4],
+    variation: [f32; 4],
 }
 
 const _: () = assert!(std::mem::size_of::<HairParams>() == HAIR_PARAMS_SIZE as usize);
@@ -714,6 +715,12 @@ fn make_params(args: ViewArgs) -> HairParams {
         ],
         filter_params: [1.0, 0.2, args.filter_scale, args.dom_extinction],
         albedo: args.groom.albedo.to_array(),
+        variation: [
+            args.groom.melanin_variation,
+            args.groom.roughness_variation,
+            0.0,
+            0.0,
+        ],
         flags: [
             flag(args.groom.lod),
             flag(args.groom.filter),

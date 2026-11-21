@@ -32,6 +32,8 @@ struct HairParams {
     dom_info: vec4<f32>,
     // Camera passes: the groom's screen rectangle, [x0, y0, x1, y1).
     rect: vec4<u32>,
+    // x melanin variation (log2 albedo exponent), y relative roughness variation.
+    variation: vec4<f32>,
 }
 
 // A deep opacity map's light view. Mirrors `ShadowLight` in pass.rs.

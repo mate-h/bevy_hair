@@ -27,8 +27,9 @@ pub use obj::load_obj_path;
 pub use render::HairPlugin;
 pub use shadow::{HairShadow, HairShadowMaterial, HairShadowReceiver};
 
-/// A groom instance. The mesh is a baked hair mesh; shading parameters are uniform
-/// across the groom and varied along each strand by the stored `uvw` coordinate.
+/// A groom instance. The mesh is a baked hair mesh; shading parameters are set per groom,
+/// varied along each strand by the stored `uvw` coordinate and between strands
+/// by a hash of its `uv`.
 #[derive(Component, Clone)]
 pub struct HairGroom {
     pub mesh: Handle<HairMesh>,
@@ -37,6 +38,11 @@ pub struct HairGroom {
     /// that produces it.
     pub albedo: Color,
     pub roughness: f32,
+    /// Per-strand spread of melanin: each strand's albedo is raised to a power
+    /// in `[2^-v, 2^v]`, which scales its absorption by about that factor.
+    pub melanin_variation: f32,
+    /// Per-strand relative spread of roughness, `roughness * (1 ± v)`.
+    pub roughness_variation: f32,
     pub tilt: f32,
     pub lod: bool,
     pub filter: bool,
@@ -58,6 +64,8 @@ impl Default for HairGroom {
             lambda: 3.0,
             albedo: Color::srgb(0.16, 0.07, 0.035),
             roughness: 0.2,
+            melanin_variation: 0.35,
+            roughness_variation: 0.25,
             tilt: 0.08,
             lod: true,
             filter: true,

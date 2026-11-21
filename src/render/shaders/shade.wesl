@@ -613,9 +613,17 @@ fn fs(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         ao = 1.0;
     }
     let beta = f32(~beta_buf[pix] & 0xffu) / 255.0;
-    let roughness = max(params.appearance.x * (0.65 + 0.7 * uvw.z), 0.04);
+    // Per-strand variation keyed on the strand's root uv, which is constant
+    // along the strand.
+    let h = pcg((unpacked.uvw.x << 6u) | unpacked.uvw.y);
+    let jitter = vec2<f32>(f32(h & 0xffffu), f32(h >> 16u)) / 32767.5 - 1.0;
+    let roughness = max(
+        params.appearance.x * (0.65 + 0.7 * uvw.z) * (1.0 + params.variation.y * jitter.y),
+        0.04,
+    );
     let tilt = params.appearance.y;
-    let albedo = params.albedo.xyz * (0.65 + 0.35 * uvw.z);
+    let base_albedo = params.albedo.xyz * (0.65 + 0.35 * uvw.z);
+    let albedo = pow(max(base_albedo, vec3<f32>(1e-4)), vec3<f32>(exp2(params.variation.x * jitter.x)));
 
     let world_h = vec4<f32>(world, 1.0);
     let view_z = dot(vec4<f32>(

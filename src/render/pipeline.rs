@@ -11,7 +11,7 @@ use crate::render::pass::{SHADOW_CHANNELS, SHADOW_LIGHT_BYTES};
 const COMMON: &str = include_str!("shaders/common.wgsl");
 
 /// `HairParams` uniform size. Keep in sync with `shaders/common.wgsl`.
-pub const HAIR_PARAMS_SIZE: u64 = 448;
+pub const HAIR_PARAMS_SIZE: u64 = 464;
 
 #[derive(Resource, Clone)]
 pub struct HairShaderHandles {
