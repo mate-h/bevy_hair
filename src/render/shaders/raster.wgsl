@@ -1,7 +1,8 @@
 @group(0) @binding(0) var<uniform> params: HairParams;
 @group(0) @binding(1) var<storage, read> bundles: array<BundleInfo>;
 @group(0) @binding(2) var<storage, read> layers: array<LayerVert>;
-@group(0) @binding(3) var<storage, read> style: array<vec4<f32>>;
+// Three f16 per texel, `[x | y << 16, z]`. See `pack_residual` in mesh.rs.
+@group(0) @binding(3) var<storage, read> style: array<vec2<u32>>;
 @group(0) @binding(4) var<storage, read> refs: array<StrandRef>;
 @group(0) @binding(5) var<storage, read_write> center: array<atomic<u64>>;
 @group(0) @binding(6) var<storage, read_write> conservative: array<atomic<u64>>;
@@ -31,32 +32,29 @@ fn sample_layer(offset: u32, layer: u32, uv: vec2<f32>) -> SmLayer {
     );
 }
 
-fn sample_style(offset: u32, uv: vec2<f32>, w: f32) -> vec3<f32> {
-    let u = clamp(uv.x, 0.0, 1.0) * f32(STYLE_U - 1u);
-    let v = clamp(uv.y, 0.0, 1.0) * f32(STYLE_V - 1u);
-    let ww = clamp(w, 0.0, 1.0) * f32(STYLE_W - 1u);
-    let u0 = u32(floor(u));
-    let v0 = u32(floor(v));
-    let w0 = u32(floor(ww));
-    let u1 = min(u0 + 1u, STYLE_U - 1u);
-    let v1 = min(v0 + 1u, STYLE_V - 1u);
-    let w1 = min(w0 + 1u, STYLE_W - 1u);
-    let tu = u - f32(u0);
-    let tv = v - f32(v0);
+fn style_texel(i: u32) -> vec3<f32> {
+    let t = style[i];
+    return vec3<f32>(unpack2x16float(t.x), unpack2x16float(t.y).x);
+}
+
+// The nearest column of the bundle (see `style_cell` in mesh.rs), at two
+// neighbouring w samples of `level`. With 2^k + 1 control points on the
+// matching level, w lands on a sample and the second read is skipped.
+fn sample_style(offset: u32, uv: vec2<f32>, w: f32, level: u32) -> vec3<f32> {
+    let w_count = style_level_w(level);
+    let cell = min(
+        vec2<u32>(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * vec2<f32>(f32(STYLE_U), f32(STYLE_V))),
+        vec2<u32>(STYLE_U - 1u, STYLE_V - 1u),
+    );
+    let ww = clamp(w, 0.0, 1.0) * f32(w_count - 1u);
+    let w0 = min(u32(floor(ww)), w_count - 1u);
     let tw = ww - f32(w0);
-    let c000 = style[style_index(offset, u0, v0, w0)].xyz;
-    let c100 = style[style_index(offset, u1, v0, w0)].xyz;
-    let c010 = style[style_index(offset, u0, v1, w0)].xyz;
-    let c110 = style[style_index(offset, u1, v1, w0)].xyz;
-    let c001 = style[style_index(offset, u0, v0, w1)].xyz;
-    let c101 = style[style_index(offset, u1, v0, w1)].xyz;
-    let c011 = style[style_index(offset, u0, v1, w1)].xyz;
-    let c111 = style[style_index(offset, u1, v1, w1)].xyz;
-    let c00 = mix(c000, c100, tu);
-    let c01 = mix(c010, c110, tu);
-    let c10 = mix(c001, c101, tu);
-    let c11 = mix(c011, c111, tu);
-    return mix(mix(c00, c01, tv), mix(c10, c11, tv), tw);
+    let i = style_index(offset, level, cell.x, cell.y, w0);
+    var r = style_texel(i);
+    if tw > 1e-4 && w0 + 1u < w_count {
+        r = mix(r, style_texel(i + 1u), tw);
+    }
+    return r;
 }
 
 fn eval_cp(idx: u32, ncp: u32, uv: vec2<f32>, style_offset: u32) -> vec4<f32> {
@@ -69,7 +67,7 @@ fn eval_cp(idx: u32, ncp: u32, uv: vec2<f32>, style_offset: u32) -> vec4<f32> {
     let b = sm[i1];
     let base = hermite(a.pos_ao.xyz, b.pos_ao.xyz, a.tangent.xyz, b.tangent.xyz, t);
     let ao = mix(a.pos_ao.w, b.pos_ao.w, t);
-    let residual = sample_style(style_offset, uv, w);
+    let residual = sample_style(style_offset, uv, w, style_level_for(ncp));
     cp_uvw[idx] = vec4<f32>(uv, w, ao);
     return vec4<f32>(base + residual, ao);
 }

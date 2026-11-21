@@ -1,17 +1,68 @@
 //! Hair-mesh groom consumed by the software rasterizer.
 //!
 //! A groom is a set of quad bundles. Each bundle has [`LAYER_COUNT`] layers of four
-//! corners, plus an 8×8×16 styling volume of residuals from the Hermite cage.
+//! corners, plus a 4×4×65 styling volume of residuals from the Hermite cage,
+//! with 33- and 17-sample levels along the strand for coarser LOD.
 
 use bevy::asset::Asset;
 use bevy::math::{Vec2, Vec3};
 use bevy::reflect::TypePath;
+use half::f16;
 
 pub const LAYER_COUNT: u32 = 16;
-pub const STYLE_U: u32 = 8;
-pub const STYLE_V: u32 = 8;
-pub const STYLE_W: u32 = 16;
-pub const STYLE_TEXELS: u32 = STYLE_U * STYLE_V * STYLE_W;
+pub const STYLE_U: u32 = 4;
+pub const STYLE_V: u32 = 4;
+/// Residual samples along the strand at full detail. LOD control point counts
+/// are 2^k + 1, so with 2^6 + 1 samples every control point lands on one.
+pub const STYLE_W: u32 = 65;
+/// Levels along w: 65, 33 and 17 samples, for 65, 33 and 17 control points.
+pub const STYLE_LEVELS: u32 = 3;
+pub const STYLE_TEXELS: u32 = style_level_base(STYLE_LEVELS);
+
+/// Samples along w at `level`.
+pub const fn style_level_w(level: u32) -> u32 {
+    ((STYLE_W - 1) >> level) + 1
+}
+
+/// Texels before `level` in a bundle's style block.
+pub const fn style_level_base(level: u32) -> u32 {
+    let mut base = 0;
+    let mut l = 0;
+    while l < level {
+        base += STYLE_U * STYLE_V * style_level_w(l);
+        l += 1;
+    }
+    base
+}
+
+/// Texel of `(u, v, w)` at `level` within a bundle's block. w is innermost, so
+/// a strand, whose uv is fixed, reads contiguous runs.
+pub fn style_index(level: u32, u: u32, v: u32, w: u32) -> usize {
+    (style_level_base(level) + (v * STYLE_U + u) * style_level_w(level) + w) as usize
+}
+
+/// The style column a uv reads. Nearest, not bilinear: a bundle holds a few
+/// strands, most with a column to themselves, and blending columns of
+/// out-of-phase curls would flatten them.
+pub fn style_cell(uv: Vec2) -> (u32, u32) {
+    let cell = |x: f32, n: u32| ((x.clamp(0.0, 1.0) * n as f32) as u32).min(n - 1);
+    (cell(uv.x, STYLE_U), cell(uv.y, STYLE_V))
+}
+
+/// A style residual as three f16, `[x | y << 16, z]`.
+pub fn pack_residual(r: Vec3) -> [u32; 2] {
+    let h = |x: f32| u32::from(f16::from_f32(x).to_bits());
+    [h(r.x) | (h(r.y) << 16), h(r.z)]
+}
+
+pub fn unpack_residual(texel: [u32; 2]) -> Vec3 {
+    let f = |bits: u32| f16::from_bits(bits as u16).to_f32();
+    Vec3::new(
+        f(texel[0] & 0xffff),
+        f(texel[0] >> 16),
+        f(texel[1] & 0xffff),
+    )
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct BundleDesc {
@@ -34,8 +85,9 @@ pub struct HairMesh {
     /// `LAYER_COUNT * 4` corners per bundle, layer-major then corner order
     /// `c00, c10, c01, c11`.
     pub corners: Vec<CageCorner>,
-    /// Residual xyz from the bilinear cage. W is unused.
-    pub style: Vec<[f32; 4]>,
+    /// Residuals from the Hermite cage, `STYLE_TEXELS` per bundle, packed by
+    /// [`pack_residual`] and laid out by [`style_index`].
+    pub style: Vec<[u32; 2]>,
     pub bounds_min: Vec3,
     pub bounds_max: Vec3,
 }
@@ -98,25 +150,30 @@ impl HairMesh {
     /// Strand position at fixed `uv` and `w`, matching the rasterizer: bilinear layers,
     /// finite-difference tangents, Hermite base, then the styling residual.
     pub fn styled_position(&self, bundle: usize, uv: Vec2, w: f32) -> Vec3 {
-        let layers_f = w.clamp(0.0, 1.0) * (LAYER_COUNT - 1) as f32;
-        let i0 = (layers_f.floor() as usize).min(LAYER_COUNT as usize - 1);
-        let i1 = (i0 + 1).min(LAYER_COUNT as usize - 1);
-        let t = layers_f - i0 as f32;
-        let p0 = bilinear(self.layer_corners(bundle, i0), uv);
-        let p1 = bilinear(self.layer_corners(bundle, i1), uv);
-        let m0 = layer_tangent(self, bundle, i0, uv);
-        let m1 = layer_tangent(self, bundle, i1, uv);
-        hermite(p0, p1, m0, m1, t) + sample_style(self, bundle, uv, w)
+        cage_position(|layer| self.layer_corners(bundle, layer), uv, w)
+            + sample_style(self, bundle, uv, w)
     }
 }
 
-fn layer_tangent(mesh: &HairMesh, bundle: usize, layer: usize, uv: Vec2) -> Vec3 {
-    let curr = bilinear(mesh.layer_corners(bundle, layer), uv);
-    let prev = bilinear(mesh.layer_corners(bundle, layer.saturating_sub(1)), uv);
-    let next = bilinear(
-        mesh.layer_corners(bundle, (layer + 1).min(LAYER_COUNT as usize - 1)),
-        uv,
-    );
+/// The unstyled strand at `uv` and `w`, as the rasterizer builds it: bilinear
+/// layers, finite-difference tangents, then a Hermite segment. `layer` returns
+/// a layer's quad. The bake fits style residuals against this curve.
+pub fn cage_position(layer: impl Fn(usize) -> [Vec3; 4], uv: Vec2, w: f32) -> Vec3 {
+    let layers_f = w.clamp(0.0, 1.0) * (LAYER_COUNT - 1) as f32;
+    let i0 = (layers_f.floor() as usize).min(LAYER_COUNT as usize - 1);
+    let i1 = (i0 + 1).min(LAYER_COUNT as usize - 1);
+    let t = layers_f - i0 as f32;
+    let p0 = bilinear(layer(i0), uv);
+    let p1 = bilinear(layer(i1), uv);
+    let m0 = layer_tangent(&layer, i0, uv);
+    let m1 = layer_tangent(&layer, i1, uv);
+    hermite(p0, p1, m0, m1, t)
+}
+
+fn layer_tangent(quad: &impl Fn(usize) -> [Vec3; 4], layer: usize, uv: Vec2) -> Vec3 {
+    let curr = bilinear(quad(layer), uv);
+    let prev = bilinear(quad(layer.saturating_sub(1)), uv);
+    let next = bilinear(quad((layer + 1).min(LAYER_COUNT as usize - 1)), uv);
     let count = LAYER_COUNT as usize;
     let (dir, scale) = if layer == 0 {
         let delta = next - curr;
@@ -149,27 +206,13 @@ fn bilinear(quad: [Vec3; 4], uv: Vec2) -> Vec3 {
         + quad[3] * u * v
 }
 
+/// Full-detail residual, as the rasterizer samples it at 65 control points.
 fn sample_style(mesh: &HairMesh, bundle: usize, uv: Vec2, w: f32) -> Vec3 {
     let offset = mesh.bundles[bundle].style_offset as usize;
-    let u = uv.x.clamp(0.0, 1.0) * (STYLE_U - 1) as f32;
-    let v = uv.y.clamp(0.0, 1.0) * (STYLE_V - 1) as f32;
+    let (u, v) = style_cell(uv);
     let ww = w.clamp(0.0, 1.0) * (STYLE_W - 1) as f32;
-    let u0 = u.floor() as usize;
-    let v0 = v.floor() as usize;
-    let w0 = ww.floor() as usize;
-    let u1 = (u0 + 1).min(STYLE_U as usize - 1);
-    let v1 = (v0 + 1).min(STYLE_V as usize - 1);
-    let w1 = (w0 + 1).min(STYLE_W as usize - 1);
-    let tu = u - u0 as f32;
-    let tv = v - v0 as f32;
-    let tw = ww - w0 as f32;
-    let at = |iu: usize, iv: usize, iw: usize| {
-        let texel = mesh.style[offset + (iw * STYLE_V as usize + iv) * STYLE_U as usize + iu];
-        Vec3::new(texel[0], texel[1], texel[2])
-    };
-    let c00 = at(u0, v0, w0).lerp(at(u1, v0, w0), tu);
-    let c01 = at(u0, v1, w0).lerp(at(u1, v1, w0), tu);
-    let c10 = at(u0, v0, w1).lerp(at(u1, v0, w1), tu);
-    let c11 = at(u0, v1, w1).lerp(at(u1, v1, w1), tu);
-    c00.lerp(c01, tv).lerp(c10.lerp(c11, tv), tw)
+    let w0 = (ww.floor() as u32).min(STYLE_W - 1);
+    let w1 = (w0 + 1).min(STYLE_W - 1);
+    let at = |iw: u32| unpack_residual(mesh.style[offset + style_index(0, u, v, iw)]);
+    at(w0).lerp(at(w1), ww - w0 as f32)
 }

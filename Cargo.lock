@@ -1054,6 +1054,7 @@ dependencies = [
  "bevy",
  "bevy_camera_controller",
  "bytemuck",
+ "half",
  "naga",
 ]
 

@@ -18,9 +18,8 @@ pub fn strand_count_lod(l: f32, strand_count: u32, delta: f32, culled: bool) -> 
     raw.clamp(1.0, n) as u32
 }
 
-/// The most control points a strand gets. The bake resamples strands to
-/// `LAYER_COUNT` points and `STYLE_W` style slices, so more add segments, not
-/// detail. Keep in sync with `MAX_CONTROL_POINTS` in `common.wgsl`.
+/// The most control points a strand gets. The style volume has `STYLE_W` (65)
+/// samples along the strand, so more add segments, not detail. Keep in sync with `MAX_CONTROL_POINTS` in `common.wgsl`.
 pub const MAX_CONTROL_POINTS: u32 = 65;
 
 /// Eqs. 4–5. `layer_count` is the hard lower bound on `C_raw`. Eq. 5 snaps down

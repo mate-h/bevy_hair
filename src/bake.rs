@@ -12,13 +12,24 @@ use bevy::math::{Mat3, Vec2, Vec3};
 use bevy::mesh::{Indices, Mesh, VertexAttributeValues};
 
 use crate::hair_file::HairStrands;
-use crate::mesh::{BundleDesc, CageCorner, HairMesh, LAYER_COUNT, STYLE_TEXELS, STYLE_U, STYLE_V};
+use crate::mesh::{
+    BundleDesc, CageCorner, HairMesh, LAYER_COUNT, STYLE_LEVELS, STYLE_TEXELS, STYLE_U, STYLE_V,
+    STYLE_W, cage_position, pack_residual, style_index, style_level_w,
+};
 
 const MIN_STRANDS_PER_BUNDLE: usize = 8;
 const TARGET_STRANDS_PER_CELL: f32 = 180.0;
 /// Split a bundle when a sample of its quad is farther than this from every strand.
 /// The uniform uv draw fills the whole quad, not just the strands.
 const MAX_QUAD_GAP: f32 = 5.0;
+/// Grid the coherence fit splats residuals into to decide bundle splits: the
+/// baked style's nearest-cell columns (`style_cell`), one slice per layer. A
+/// bundle splits where strands sharing a column disagree, since the column
+/// can only hold their mean.
+const FIT_U: u32 = STYLE_U;
+const FIT_V: u32 = STYLE_V;
+const FIT_TEXELS: u32 = FIT_U * FIT_V * LAYER_COUNT;
+
 /// Split when strands that share a style texel disagree by more than this.
 const MAX_STYLE_STDDEV: f32 = 2.0;
 /// Split until each member strand is this close to `f(uvw)` at its root uv.
@@ -148,20 +159,7 @@ pub fn bake_hair_mesh_with_scalp(strands: &HairStrands, scalp: Option<&Scalp>) -
 
         let layer_offset = corners.len() as u32;
         let style_offset = style.len() as u32;
-        let mut style_sum = vec![Vec3::ZERO; STYLE_TEXELS as usize];
-        let mut style_weight = vec![0.0f32; STYLE_TEXELS as usize];
-
-        for (_, samples) in &kept {
-            let uv = root_frame.uv(samples[0]);
-            if !uv_in_unit(uv) {
-                continue;
-            }
-            let uv = uv.clamp(Vec2::ZERO, Vec2::ONE);
-            for (layer, point) in samples.iter().enumerate() {
-                let residual = *point - bilinear(layer_corners[layer], uv);
-                splat_residual(&mut style_sum, &mut style_weight, uv, layer, residual);
-            }
-        }
+        style.extend(bake_style(strands, &kept, root_frame, &layer_corners));
 
         for layer in 0..LAYER_COUNT as usize {
             let quad = layer_corners[layer];
@@ -181,15 +179,6 @@ pub fn bake_hair_mesh_with_scalp(strands: &HairStrands, scalp: Option<&Scalp>) -
                     ao: 1.0,
                 });
             }
-        }
-
-        for i in 0..STYLE_TEXELS as usize {
-            let residual = if style_weight[i] > 0.0 {
-                style_sum[i] / style_weight[i]
-            } else {
-                Vec3::ZERO
-            };
-            style.push([residual.x, residual.y, residual.z, 0.0]);
         }
 
         bundles.push(BundleDesc {
@@ -680,37 +669,147 @@ impl Frame {
     }
 }
 
-fn resample_indexed(strands: &HairStrands, group: &[usize]) -> Vec<(usize, Vec<Vec3>)> {
-    let layers = LAYER_COUNT as usize;
-    let mut out = Vec::with_capacity(group.len());
-    for &strand in group {
-        let (start, count) = strands.strands[strand];
-        if count < 2 {
+/// The bundle's style volume, `STYLE_TEXELS` packed residuals. Each strand is
+/// resampled at `STYLE_W` points and compared with the cage curve the
+/// rasterizer evaluates at the same w, then splatted bilinearly at its root uv.
+/// Columns no strand reaches copy the nearest filled column: rendered strands
+/// take uvs across the whole quad, and zeros there would flatten their curls.
+/// Coarser levels low-pass the full one so fewer control points don't alias.
+fn bake_style(
+    strands: &HairStrands,
+    kept: &[(usize, Vec<Vec3>)],
+    root_frame: Frame,
+    layer_corners: &[[Vec3; 4]],
+) -> Vec<[u32; 2]> {
+    let columns = (STYLE_U * STYLE_V) as usize;
+    let w_count = STYLE_W as usize;
+    let mut sum = vec![Vec3::ZERO; columns * w_count];
+    let mut weight = vec![0.0f32; columns];
+    for (strand, layers) in kept {
+        let uv = root_frame.uv(layers[0]);
+        if !uv_in_unit(uv) {
             continue;
         }
-        let pts = &strands.points[start as usize..(start + count) as usize];
-        let mut cumulative = vec![0.0f32; pts.len()];
-        for i in 1..pts.len() {
-            cumulative[i] = cumulative[i - 1] + pts[i].distance(pts[i - 1]);
-        }
-        let length = cumulative[pts.len() - 1];
-        if length < 1e-5 {
+        let uv = uv.clamp(Vec2::ZERO, Vec2::ONE);
+        let (start, count) = strands.strands[*strand];
+        let points = &strands.points[start as usize..(start + count) as usize];
+        let Some(samples) = resample(points, w_count) else {
             continue;
-        }
-        let mut samples = Vec::with_capacity(layers);
-        for layer in 0..layers {
-            let target = length * layer as f32 / (layers - 1) as f32;
-            let mut index = 1;
-            while index + 1 < pts.len() && cumulative[index] < target {
-                index += 1;
+        };
+        let (cu, cv) = crate::mesh::style_cell(uv);
+        let splat = [(cu, cv, 1.0f32)];
+        for (iw, point) in samples.iter().enumerate() {
+            let w = iw as f32 / (w_count - 1) as f32;
+            let residual = *point - cage_position(|layer| layer_corners[layer], uv, w);
+            for (iu, iv, alpha) in splat {
+                if alpha > 0.0 {
+                    sum[(iv * STYLE_U + iu) as usize * w_count + iw] += residual * alpha;
+                }
             }
-            let span = (cumulative[index] - cumulative[index - 1]).max(1e-6);
-            let t = ((target - cumulative[index - 1]) / span).clamp(0.0, 1.0);
-            samples.push(pts[index - 1].lerp(pts[index], t));
         }
-        out.push((strand, samples));
+        for (iu, iv, alpha) in splat {
+            weight[(iv * STYLE_U + iu) as usize] += alpha;
+        }
+    }
+
+    // Full-detail columns, empty ones filled from the nearest filled column
+    // (averaged over ties).
+    let filled: Vec<usize> = (0..columns).filter(|&c| weight[c] > 1e-6).collect();
+    let mut level0 = vec![Vec3::ZERO; columns * w_count];
+    for column in 0..columns {
+        let sources: Vec<usize> = if weight[column] > 1e-6 {
+            vec![column]
+        } else {
+            let dist = |c: usize| {
+                let (cu, cv) = ((c % STYLE_U as usize) as i32, (c / STYLE_U as usize) as i32);
+                let (u, v) = (
+                    (column % STYLE_U as usize) as i32,
+                    (column / STYLE_U as usize) as i32,
+                );
+                (cu - u).pow(2) + (cv - v).pow(2)
+            };
+            let nearest = filled.iter().map(|&c| dist(c)).min();
+            filled
+                .iter()
+                .copied()
+                .filter(|&c| Some(dist(c)) == nearest)
+                .collect()
+        };
+        for iw in 0..w_count {
+            let mut total = Vec3::ZERO;
+            for &source in &sources {
+                total += sum[source * w_count + iw] / weight[source];
+            }
+            if !sources.is_empty() {
+                level0[column * w_count + iw] = total / sources.len() as f32;
+            }
+        }
+    }
+
+    let mut out = vec![[0u32; 2]; STYLE_TEXELS as usize];
+    let mut level = level0;
+    for l in 0..STYLE_LEVELS {
+        let w_l = style_level_w(l) as usize;
+        if l > 0 {
+            // [1 2 1] / 4 around every other sample of the finer level.
+            let finer_w = style_level_w(l - 1) as usize;
+            let mut coarse = vec![Vec3::ZERO; columns * w_l];
+            for column in 0..columns {
+                let at =
+                    |i: isize| level[column * finer_w + i.clamp(0, finer_w as isize - 1) as usize];
+                for iw in 0..w_l {
+                    let c = 2 * iw as isize;
+                    coarse[column * w_l + iw] = at(c - 1) * 0.25 + at(c) * 0.5 + at(c + 1) * 0.25;
+                }
+            }
+            level = coarse;
+        }
+        for column in 0..columns {
+            let (u, v) = (column as u32 % STYLE_U, column as u32 / STYLE_U);
+            for iw in 0..w_l {
+                out[style_index(l, u, v, iw as u32)] = pack_residual(level[column * w_l + iw]);
+            }
+        }
     }
     out
+}
+
+/// `count` points evenly spaced by arc length along a polyline.
+fn resample(pts: &[Vec3], count: usize) -> Option<Vec<Vec3>> {
+    if pts.len() < 2 {
+        return None;
+    }
+    let mut cumulative = vec![0.0f32; pts.len()];
+    for i in 1..pts.len() {
+        cumulative[i] = cumulative[i - 1] + pts[i].distance(pts[i - 1]);
+    }
+    let length = cumulative[pts.len() - 1];
+    if length < 1e-5 {
+        return None;
+    }
+    let mut samples = Vec::with_capacity(count);
+    let mut index = 1;
+    for i in 0..count {
+        let target = length * i as f32 / (count - 1) as f32;
+        while index + 1 < pts.len() && cumulative[index] < target {
+            index += 1;
+        }
+        let span = (cumulative[index] - cumulative[index - 1]).max(1e-6);
+        let t = ((target - cumulative[index - 1]) / span).clamp(0.0, 1.0);
+        samples.push(pts[index - 1].lerp(pts[index], t));
+    }
+    Some(samples)
+}
+
+fn resample_indexed(strands: &HairStrands, group: &[usize]) -> Vec<(usize, Vec<Vec3>)> {
+    group
+        .iter()
+        .filter_map(|&strand| {
+            let (start, count) = strands.strands[strand];
+            let pts = &strands.points[start as usize..(start + count) as usize];
+            resample(pts, LAYER_COUNT as usize).map(|samples| (strand, samples))
+        })
+        .collect()
 }
 
 fn root_frame(strands: &[Vec<Vec3>]) -> Frame {
@@ -843,9 +942,9 @@ struct StyleFit {
 }
 
 fn accumulate_style(strands: &[Vec<Vec3>], frames: &[Frame]) -> StyleFit {
-    let mut sum = vec![Vec3::ZERO; STYLE_TEXELS as usize];
-    let mut sum_sq = vec![0.0f32; STYLE_TEXELS as usize];
-    let mut weight = vec![0.0f32; STYLE_TEXELS as usize];
+    let mut sum = vec![Vec3::ZERO; FIT_TEXELS as usize];
+    let mut sum_sq = vec![0.0f32; FIT_TEXELS as usize];
+    let mut weight = vec![0.0f32; FIT_TEXELS as usize];
     let root = frames[0];
     for strand in strands {
         let uv = root.uv(strand[0]);
@@ -855,30 +954,8 @@ fn accumulate_style(strands: &[Vec<Vec3>], frames: &[Frame]) -> StyleFit {
         let uv = uv.clamp(Vec2::ZERO, Vec2::ONE);
         for (layer, point) in strand.iter().enumerate() {
             let residual = *point - bilinear(frames[layer].quad(), uv);
-            splat_residual(&mut sum, &mut weight, uv, layer, residual);
-            let u = uv.x * (STYLE_U - 1) as f32;
-            let v = uv.y * (STYLE_V - 1) as f32;
-            let u0 = u.floor() as u32;
-            let v0 = v.floor() as u32;
-            let u1 = (u0 + 1).min(STYLE_U - 1);
-            let v1 = (v0 + 1).min(STYLE_V - 1);
-            let tu = u - u0 as f32;
-            let tv = v - v0 as f32;
-            let w = layer as u32;
-            let length_sq = residual.length_squared();
-            let corners = [
-                (u0, v0, (1.0 - tu) * (1.0 - tv)),
-                (u1, v0, tu * (1.0 - tv)),
-                (u0, v1, (1.0 - tu) * tv),
-                (u1, v1, tu * tv),
-            ];
-            for (iu, iv, alpha) in corners {
-                if alpha <= 0.0 {
-                    continue;
-                }
-                let index = ((w * STYLE_V + iv) * STYLE_U + iu) as usize;
-                sum_sq[index] += length_sq * alpha;
-            }
+            let index = splat_residual(&mut sum, &mut weight, uv, layer, residual);
+            sum_sq[index] += residual.length_squared();
         }
     }
     StyleFit {
@@ -889,7 +966,7 @@ fn accumulate_style(strands: &[Vec<Vec3>], frames: &[Frame]) -> StyleFit {
 }
 
 fn style_means(fit: &StyleFit) -> Vec<[f32; 4]> {
-    let mut style = vec![[0.0f32; 4]; STYLE_TEXELS as usize];
+    let mut style = vec![[0.0f32; 4]; FIT_TEXELS as usize];
     for (texel, ((accumulated, weight), sum_sq)) in style
         .iter_mut()
         .zip(fit.sum.iter().zip(&fit.weight).zip(&fit.sum_sq))
@@ -916,28 +993,20 @@ fn worst_stddev(fit: &StyleFit) -> (f32, usize) {
         let stddev = variance.sqrt();
         if stddev > worst {
             worst = stddev;
-            layer = index / (STYLE_U as usize * STYLE_V as usize);
+            layer = index / (FIT_U as usize * FIT_V as usize);
         }
     }
     (worst, layer)
 }
 
 fn style_slice(style: &[[f32; 4]], uv: Vec2, layer: usize) -> Vec3 {
-    let u = uv.x.clamp(0.0, 1.0) * (STYLE_U - 1) as f32;
-    let v = uv.y.clamp(0.0, 1.0) * (STYLE_V - 1) as f32;
-    let u0 = u.floor() as usize;
-    let v0 = v.floor() as usize;
-    let u1 = (u0 + 1).min(STYLE_U as usize - 1);
-    let v1 = (v0 + 1).min(STYLE_V as usize - 1);
-    let tu = u - u0 as f32;
-    let tv = v - v0 as f32;
-    let at = |iu: usize, iv: usize| {
-        let texel = style[(layer * STYLE_V as usize + iv) * STYLE_U as usize + iu];
-        Vec3::new(texel[0], texel[1], texel[2])
-    };
-    let c0 = at(u0, v0).lerp(at(u1, v0), tu);
-    let c1 = at(u0, v1).lerp(at(u1, v1), tu);
-    c0.lerp(c1, tv)
+    let texel = style[fit_index(uv, layer)];
+    Vec3::new(texel[0], texel[1], texel[2])
+}
+
+fn fit_index(uv: Vec2, layer: usize) -> usize {
+    let (u, v) = crate::mesh::style_cell(uv);
+    ((layer as u32 * FIT_V + v) * FIT_U + u) as usize
 }
 
 /// Distance from styled quad samples to the strands. The rasterizer draws these
@@ -1096,30 +1165,18 @@ fn bilinear(quad: [Vec3; 4], uv: Vec2) -> Vec3 {
         + quad[3] * u * v
 }
 
-fn splat_residual(sum: &mut [Vec3], weight: &mut [f32], uv: Vec2, layer: usize, residual: Vec3) {
-    let u = uv.x.clamp(0.0, 1.0) * (STYLE_U - 1) as f32;
-    let v = uv.y.clamp(0.0, 1.0) * (STYLE_V - 1) as f32;
-    let u0 = u.floor() as u32;
-    let v0 = v.floor() as u32;
-    let u1 = (u0 + 1).min(STYLE_U - 1);
-    let v1 = (v0 + 1).min(STYLE_V - 1);
-    let tu = u - u0 as f32;
-    let tv = v - v0 as f32;
-    let w = layer as u32;
-    let corners = [
-        (u0, v0, (1.0 - tu) * (1.0 - tv)),
-        (u1, v0, tu * (1.0 - tv)),
-        (u0, v1, (1.0 - tu) * tv),
-        (u1, v1, tu * tv),
-    ];
-    for (iu, iv, alpha) in corners {
-        if alpha <= 0.0 {
-            continue;
-        }
-        let index = ((w * STYLE_V + iv) * STYLE_U + iu) as usize;
-        sum[index] += residual * alpha;
-        weight[index] += alpha;
-    }
+/// Adds `residual` to its fit texel and returns the texel.
+fn splat_residual(
+    sum: &mut [Vec3],
+    weight: &mut [f32],
+    uv: Vec2,
+    layer: usize,
+    residual: Vec3,
+) -> usize {
+    let index = fit_index(uv, layer);
+    sum[index] += residual;
+    weight[index] += 1.0;
+    index
 }
 
 struct OccluderGrid {
@@ -1401,7 +1458,7 @@ mod tests {
         let max_residual = mesh
             .style
             .iter()
-            .map(|r| Vec3::new(r[0], r[1], r[2]).length())
+            .map(|r| crate::mesh::unpack_residual(*r).length())
             .fold(0.0f32, f32::max);
         assert!(
             max_residual < 1e-2,

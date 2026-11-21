@@ -1,7 +1,9 @@
 const LAYER_COUNT: u32 = 16u;
-const STYLE_U: u32 = 8u;
-const STYLE_V: u32 = 8u;
-const STYLE_W: u32 = 16u;
+// Keep in sync with `STYLE_U`, `STYLE_V`, `STYLE_W` and `STYLE_LEVELS` in mesh.rs.
+const STYLE_U: u32 = 4u;
+const STYLE_V: u32 = 4u;
+const STYLE_W: u32 = 65u;
+const STYLE_LEVELS: u32 = 3u;
 const PI: f32 = 3.14159265;
 // Opacity slices hung off the per-texel front depth. Keep in sync with `DOM_LAYERS`.
 const DOM_LAYERS: u32 = 16u;
@@ -264,8 +266,8 @@ fn reconstruct_world(params: HairParams, pixel: vec2<i32>, view_dist: f32) -> ve
     return params.camera_pos.xyz + dir * (view_dist / denom);
 }
 
-// The bake resamples strands to `LAYER_COUNT` points and `STYLE_W` style
-// slices, so control points past 65 add segments, not detail. Keep in sync
+// The style volume has `STYLE_W` samples along the strand, so control points
+// past 65 add segments, not detail. Keep in sync
 // with `MAX_CONTROL_POINTS` in lod.rs.
 const MAX_CONTROL_POINTS: u32 = 65u;
 
@@ -279,6 +281,28 @@ fn control_points_for_lod(l: f32) -> u32 {
     return min(span + 1u, MAX_CONTROL_POINTS);
 }
 
-fn style_index(offset: u32, u: u32, v: u32, w: u32) -> u32 {
-    return offset + (w * STYLE_V + v) * STYLE_U + u;
+// Samples along w at `level`: 65, 33, 17. Mirrors `style_level_w` in mesh.rs.
+fn style_level_w(level: u32) -> u32 {
+    return ((STYLE_W - 1u) >> level) + 1u;
+}
+
+// Mirrors `style_index` in mesh.rs: levels in order, w innermost.
+fn style_index(offset: u32, level: u32, u: u32, v: u32, w: u32) -> u32 {
+    var base = 0u;
+    for (var l = 0u; l < level; l++) {
+        base += STYLE_U * STYLE_V * style_level_w(l);
+    }
+    return offset + base + (v * STYLE_U + u) * style_level_w(level) + w;
+}
+
+// The finest style level a strand of `ncp` control points can follow: one
+// sample per control point.
+fn style_level_for(ncp: u32) -> u32 {
+    if ncp >= STYLE_W {
+        return 0u;
+    }
+    if ncp >= style_level_w(1u) {
+        return 1u;
+    }
+    return 2u;
 }

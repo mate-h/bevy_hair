@@ -139,7 +139,7 @@ pub fn init_pipelines(
                 params_uniform(),
                 ro(16),
                 ro(32),
-                ro(16),
+                ro(8),
                 ro(16),
                 rw(8),
                 rw(8),

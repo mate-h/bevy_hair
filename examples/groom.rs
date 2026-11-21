@@ -14,7 +14,7 @@
 //! `HAIR_HEADLESS=1` (implied by `HAIR_SCREENSHOT`) renders offscreen at
 //! 2560×1440 with no window, so profiling runs never take focus or input.
 //! TAA is on by default (`T` toggles it, `HAIR_TAA=0` starts without it), and
-//! `HAIR_ORBIT=<degrees per 60 frames>` circles the camera to check it in motion,
+//! `HAIR_GROOM=0|1|2` picks the starting groom. `HAIR_ORBIT=<degrees per 60 frames>` circles the camera to check it in motion,
 //! and `HAIR_SCREENSHOT_FRAME=<n>` shoots a fixed frame so orbit runs line up.
 
 mod bake;
@@ -294,6 +294,12 @@ fn setup(
     } else {
         RenderTarget::default()
     };
+    // `HAIR_GROOM=0|1|2` starts on the straight, wavy or curly groom.
+    let first_groom = std::env::var("HAIR_GROOM")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&i| i < 3)
+        .unwrap_or(0);
     let handles = [
         hair.add(std::mem::replace(&mut prepared.grooms[0], empty_groom())),
         hair.add(std::mem::replace(&mut prepared.grooms[1], empty_groom())),
@@ -328,7 +334,7 @@ fn setup(
     ));
     commands.spawn((
         HairGroom {
-            mesh: handles[0].clone(),
+            mesh: handles[first_groom].clone(),
             // Roughness picks a prefiltered specular mip. Tilt shifts the primary R highlight.
             // Albedo is the multiple-scattered color; the shader solves for absorption.
             albedo: Color::srgb(0.27, 0.20, 0.15),
@@ -341,7 +347,10 @@ fn setup(
         },
         model,
     ));
-    commands.insert_resource(GroomLibrary { handles, active: 0 });
+    commands.insert_resource(GroomLibrary {
+        handles,
+        active: first_groom,
+    });
 
     // Environment sun, 12° up. Startup yaw matches `EnvTurntable::angle`.
     let sun_dir = Vec3::new(0.788, 0.217, 0.576).normalize();

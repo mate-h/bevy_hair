@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 bevy = { git = "https://github.com/mate-h/bevy", branch = "m/shadow-factors", features = ["3d"] }
 bytemuck = { version = "1", features = ["derive"] }
+half = "2.7"
 
 [[example]]
 name = "bake"

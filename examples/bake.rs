@@ -152,7 +152,7 @@ fn write_cache(source: &Path, mesh: &HairMesh) -> std::io::Result<()> {
 
 fn encode(stamp: &SourceStamp, mesh: &HairMesh) -> Vec<u8> {
     let mut out = Vec::with_capacity(
-        72 + mesh.bundles.len() * 12 + mesh.corners.len() * 28 + mesh.style.len() * 16,
+        72 + mesh.bundles.len() * 12 + mesh.corners.len() * 28 + mesh.style.len() * 8,
     );
     out.extend_from_slice(CACHE_MAGIC);
     push_u64(&mut out, BAKE_FINGERPRINT);
@@ -178,9 +178,8 @@ fn encode(stamp: &SourceStamp, mesh: &HairMesh) -> Vec<u8> {
         push_f32(&mut out, corner.ao);
     }
     for texel in &mesh.style {
-        for channel in texel {
-            push_f32(&mut out, *channel);
-        }
+        push_u32(&mut out, texel[0]);
+        push_u32(&mut out, texel[1]);
     }
     out
 }
@@ -206,7 +205,7 @@ fn decode(bytes: &[u8], stamp: &SourceStamp) -> Option<HairMesh> {
     let style_count = cursor.u32()? as usize;
     let bounds_min = cursor.vec3()?;
     let bounds_max = cursor.vec3()?;
-    let payload = bundle_count * 12 + corner_count * 28 + style_count * 16;
+    let payload = bundle_count * 12 + corner_count * 28 + style_count * 8;
     if bytes.len() - cursor.at != payload {
         return None;
     }
@@ -229,7 +228,7 @@ fn decode(bytes: &[u8], stamp: &SourceStamp) -> Option<HairMesh> {
     }
     let mut style = Vec::with_capacity(style_count);
     for _ in 0..style_count {
-        style.push([cursor.f32()?, cursor.f32()?, cursor.f32()?, cursor.f32()?]);
+        style.push([cursor.u32()?, cursor.u32()?]);
     }
     Some(HairMesh {
         bundles,
