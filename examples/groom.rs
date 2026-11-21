@@ -13,6 +13,9 @@
 //!
 //! `HAIR_HEADLESS=1` (implied by `HAIR_SCREENSHOT`) renders offscreen at
 //! 2560×1440 with no window, so profiling runs never take focus or input.
+//! TAA is on by default (`T` toggles it, `HAIR_TAA=0` starts without it), and
+//! `HAIR_ORBIT=<degrees per 60 frames>` circles the camera to check it in motion,
+//! and `HAIR_SCREENSHOT_FRAME=<n>` shoots a fixed frame so orbit runs line up.
 
 mod bake;
 
@@ -20,19 +23,22 @@ use std::f32::consts::FRAC_PI_2;
 use std::fmt;
 use std::time::Duration;
 
+use bevy::anti_alias::taa::TemporalAntiAliasing;
 use bevy::app::{PluginGroup, RunFixedMainLoop, RunFixedMainLoopSystems, ScheduleRunnerPlugin};
-use bevy::camera::RenderTarget;
 use bevy::camera::Hdr;
+use bevy::camera::RenderTarget;
+use bevy::diagnostic::FrameCount;
 use bevy::light::{CascadeShadowConfigBuilder, MaterialShadowChannel};
 use bevy::log::LogPlugin;
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
 use bevy::render::RenderPlugin;
+use bevy::render::camera::{MipBias, TemporalJitter};
 use bevy::render::render_resource::{TextureFormat, TextureUsages, WgpuFeatures};
 use bevy::render::settings::WgpuSettings;
+use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::ExitCondition;
 use bevy::winit::WinitPlugin;
-use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy_camera_controller::free_camera::{
     FreeCamera, FreeCameraPlugin, run_freecamera_controller,
 };
@@ -91,7 +97,7 @@ fn main() {
             Update,
             (controls, draw_cages, apply_rig, spin_environment).chain(),
         )
-        .add_systems(Update, screenshot_and_exit)
+        .add_systems(Update, (screenshot_and_exit, toggle_taa, orbit_camera))
         .run();
 }
 
@@ -111,6 +117,7 @@ struct OffscreenTarget(Handle<Image>);
 fn screenshot_and_exit(
     mut commands: Commands,
     time: Res<Time<Real>>,
+    frame: Res<FrameCount>,
     mut state: Local<Option<f32>>,
     mut exit: MessageWriter<AppExit>,
     offscreen: Option<Res<OffscreenTarget>>,
@@ -125,14 +132,21 @@ fn screenshot_and_exit(
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(40.0);
-            if now >= after {
+            // `HAIR_SCREENSHOT_FRAME` takes that frame instead, so motion
+            // driven by the frame count lands on the same pose every run.
+            let due = match std::env::var("HAIR_SCREENSHOT_FRAME")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                Some(at) => frame.0 == at,
+                None => now >= after,
+            };
+            if due {
                 let shot = match offscreen {
                     Some(target) => Screenshot::image(target.0.clone()),
                     None => Screenshot::primary_window(),
                 };
-                commands
-                    .spawn(shot)
-                    .observe(save_to_disk(path));
+                commands.spawn(shot).observe(save_to_disk(path));
                 *state = Some(now);
             }
         }
@@ -160,7 +174,8 @@ bevy_hair Controls:
     {:?} & {:?}\t- Decrease and increase lambda
     {:?}\t- Toggle bundle cage wireframe
     {:?}\t- Switch studio and environment-sun lighting
-    {:?}\t- Spin the environment (and the sun outside the studio)",
+    {:?}\t- Spin the environment (and the sun outside the studio)
+    {:?}\t- Toggle temporal antialiasing",
             KeyCode::Digit1,
             KeyCode::Digit2,
             KeyCode::Digit3,
@@ -173,6 +188,7 @@ bevy_hair Controls:
             KeyCode::KeyC,
             KeyCode::KeyK,
             KeyCode::Space,
+            KeyCode::KeyT,
         )
     }
 }
@@ -254,6 +270,7 @@ fn prepare_assets() -> Prepared {
     Prepared { grooms, head }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn setup(
     mut commands: Commands,
     mut prepared: ResMut<Prepared>,
@@ -293,6 +310,7 @@ fn setup(
     // The Cem Yuksel grooms are Z-up. Bevy is Y-up.
     let model = Transform::from_rotation(Quat::from_rotation_x(-FRAC_PI_2));
     let focus = Vec3::new(-5.0, 15.0, 0.0);
+    commands.insert_resource(Orbit(focus));
     commands.spawn((
         Mesh3d(meshes.add(head)),
         // The hair shadows the head through the key light's deep opacity map.
@@ -331,46 +349,53 @@ fn setup(
     let env_yaw = Quat::from_rotation_y(env_angle);
     let diffuse = asset_server.load("env/little_paris_eiffel_tower_2k_diffuse.ktx2");
     let specular = asset_server.load("env/little_paris_eiffel_tower_2k_specular.ktx2");
-    commands.spawn((
-        Camera3d {
-            depth_texture_usages: (TextureUsages::RENDER_ATTACHMENT
-                | TextureUsages::TEXTURE_BINDING)
-                .into(),
-            ..default()
-        },
-        // 50mm on a 36×24mm sensor. Bevy stores the vertical angle.
-        Projection::Perspective(PerspectiveProjection {
-            fov: 2.0 * (24.0_f32 / (2.0 * 50.0)).atan(),
-            ..default()
-        }),
-        target,
-        Hdr,
-        Msaa::Off,
-        EnvironmentMapLight {
-            diffuse_map: diffuse,
-            specular_map: specular,
-            intensity: ENV_INTENSITY,
-            rotation: env_yaw,
-            ..default()
-        },
-        // Same heading as (150, 0, 40), 15° above the face, far enough for the 50mm frame.
-        {
-            let heading = Vec3::new(150.0, 0.0, 40.0).normalize();
-            let pitch = 15.0_f32.to_radians();
-            let distance = 431.0;
-            let eye =
-                focus + heading * (distance * pitch.cos()) + Vec3::Y * (distance * pitch.sin());
-            Transform::from_translation(eye).looking_at(focus, Vec3::Y)
-        },
-        FreeCamera {
-            // The head is about 120 units tall.
-            walk_speed: 40.0,
-            run_speed: 120.0,
-            // `M` toggles the deep opacity map in `controls`.
-            keyboard_key_toggle_cursor_grab: KeyCode::KeyG,
-            ..default()
-        },
-    ));
+    let camera = commands
+        .spawn((
+            Camera3d {
+                depth_texture_usages: (TextureUsages::RENDER_ATTACHMENT
+                    | TextureUsages::TEXTURE_BINDING)
+                    .into(),
+                ..default()
+            },
+            // 50mm on a 36×24mm sensor. Bevy stores the vertical angle.
+            Projection::Perspective(PerspectiveProjection {
+                fov: 2.0 * (24.0_f32 / (2.0 * 50.0)).atan(),
+                ..default()
+            }),
+            target,
+            Hdr,
+            Msaa::Off,
+            EnvironmentMapLight {
+                diffuse_map: diffuse,
+                specular_map: specular,
+                intensity: ENV_INTENSITY,
+                rotation: env_yaw,
+                ..default()
+            },
+            // Same heading as (150, 0, 40), 15° above the face, far enough for the 50mm frame.
+            {
+                let heading = Vec3::new(150.0, 0.0, 40.0).normalize();
+                let pitch = 15.0_f32.to_radians();
+                let distance = 431.0;
+                let eye =
+                    focus + heading * (distance * pitch.cos()) + Vec3::Y * (distance * pitch.sin());
+                Transform::from_translation(eye).looking_at(focus, Vec3::Y)
+            },
+            FreeCamera {
+                // The head is about 120 units tall.
+                walk_speed: 40.0,
+                run_speed: 120.0,
+                // `M` toggles the deep opacity map in `controls`.
+                keyboard_key_toggle_cursor_grab: KeyCode::KeyG,
+                ..default()
+            },
+        ))
+        .id();
+    if taa_enabled() {
+        commands
+            .entity(camera)
+            .insert(TemporalAntiAliasing::default());
+    }
 
     // Replaces the disk the bake removed. Exposure stays at EV 9.7.
     // `spin_environment` continues from this yaw.
@@ -498,6 +523,61 @@ fn controls(
     if keys.just_pressed(KeyCode::KeyC) {
         cages.0 = !cages.0;
         info!("cage wireframe: {}", on_off(cages.0));
+    }
+}
+
+/// The point the camera starts looking at.
+#[derive(Resource)]
+struct Orbit(Vec3);
+
+/// `HAIR_ORBIT=<degrees per second at 60 fps>` circles the camera around the
+/// head a fixed step per frame, to check temporal stability in motion.
+fn orbit_camera(
+    orbit: Option<Res<Orbit>>,
+    mut cameras: Query<&mut Transform, With<Camera3d>>,
+    mut rate: Local<Option<Option<f32>>>,
+) {
+    let rate = *rate.get_or_insert_with(|| {
+        std::env::var("HAIR_ORBIT")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+    });
+    let (Some(rate), Some(orbit)) = (rate, orbit) else {
+        return;
+    };
+    // A fixed step per frame, as at 60 fps, so a frame number pins the pose.
+    let turn = Quat::from_rotation_y((rate / 60.0).to_radians());
+    for mut transform in &mut cameras {
+        transform.rotate_around(orbit.0, turn);
+    }
+}
+
+/// TAA is on unless `HAIR_TAA=0`. The hair writes motion vectors in its
+/// composite and rasterizes with TAA's jitter.
+fn taa_enabled() -> bool {
+    std::env::var("HAIR_TAA").map_or(true, |v| v != "0")
+}
+
+fn toggle_taa(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut commands: Commands,
+    cameras: Query<(Entity, Has<TemporalAntiAliasing>), With<Camera3d>>,
+) {
+    if !keys.just_pressed(KeyCode::KeyT) {
+        return;
+    }
+    for (camera, on) in &cameras {
+        if on {
+            // The jitter would shake the image without TAA to resolve it.
+            commands
+                .entity(camera)
+                .remove::<(TemporalAntiAliasing, TemporalJitter, MipBias)>();
+        } else {
+            commands
+                .entity(camera)
+                .insert(TemporalAntiAliasing::default());
+        }
+        info!("temporal antialiasing: {}", on_off(!on));
     }
 }
 

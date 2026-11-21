@@ -34,6 +34,12 @@ struct HairParams {
     rect: vec4<u32>,
     // x melanin variation (log2 albedo exponent), y relative roughness variation.
     variation: vec4<f32>,
+    // Camera passes: the unjittered clip_from_world, and last frame's
+    // unjittered clip_from_world with this groom's motion folded in, so both
+    // take this frame's world position. Motion vectors come from their
+    // difference.
+    motion_clip: mat4x4<f32>,
+    prev_clip: mat4x4<f32>,
 }
 
 // A deep opacity map's light view. Mirrors `ShadowLight` in pass.rs.

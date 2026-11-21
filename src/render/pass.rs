@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 
 use bevy::asset::AssetId;
+use bevy::core_pipeline::prepass::{PreviousViewData, ViewPrepassTextures};
 use bevy::ecs::system::SystemParam;
 use bevy::light::MAX_MATERIAL_SHADOW_CHANNELS;
 use bevy::math::{Mat4, Vec2, Vec3, Vec4};
 use bevy::pbr::{MeshPipelineViewLayoutKey, MeshViewBindGroup, ViewKeyCache};
 use bevy::prelude::*;
+use bevy::render::camera::TemporalJitter;
 use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_resource::*;
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery};
@@ -67,6 +69,8 @@ struct HairParams {
     dom_info: [f32; 4],
     rect: [u32; 4],
     variation: [f32; 4],
+    motion_clip: [[f32; 4]; 4],
+    prev_clip: [[f32; 4]; 4],
 }
 
 const _: () = assert!(std::mem::size_of::<HairParams>() == HAIR_PARAMS_SIZE as usize);
@@ -276,7 +280,7 @@ pub struct HairPassState {
     pub frame: FrameGpu,
     composite_greater: Option<CachedRenderPipelineId>,
     composite_less: Option<CachedRenderPipelineId>,
-    composite_key: Option<(TextureFormat, TextureFormat)>,
+    composite_key: Option<(TextureFormat, TextureFormat, Option<TextureFormat>)>,
 }
 
 #[derive(SystemParam)]
@@ -292,13 +296,18 @@ pub(crate) struct HairPass<'w> {
     shader_buffers: Res<'w, RenderAssets<GpuShaderBuffer>>,
 }
 
+type HairView = (
+    &'static bevy::render::view::ExtractedView,
+    &'static ViewTarget,
+    &'static ViewDepthStencilTexture,
+    &'static MeshViewBindGroup,
+    Option<&'static TemporalJitter>,
+    Option<&'static PreviousViewData>,
+    Option<&'static ViewPrepassTextures>,
+);
+
 pub fn hair_pass(
-    view: ViewQuery<(
-        &bevy::render::view::ExtractedView,
-        &ViewTarget,
-        &ViewDepthStencilTexture,
-        &MeshViewBindGroup,
-    )>,
+    view: ViewQuery<HairView>,
     mut ctx: RenderContext,
     hair: HairPass,
     mut state: ResMut<HairPassState>,
@@ -322,7 +331,7 @@ pub fn hair_pass(
     let shadow_light_dst = shadow
         .as_ref()
         .and_then(|shadow| shader_buffers.get(&shadow.light));
-    let (view, target, depth, mesh_view) = view.into_inner();
+    let (view, target, depth, mesh_view, jitter, previous_view, prepass) = view.into_inner();
     let Some(mesh_key) = view_keys.get(&view.retained_view_entity) else {
         return;
     };
@@ -385,9 +394,24 @@ pub fn hair_pass(
     let world_from_view = view.world_from_view.to_matrix();
     let camera_pos = world_from_view.transform_point3(Vec3::ZERO);
     let forward = (-world_from_view.transform_vector3(Vec3::Z)).normalize_or(Vec3::NEG_Z);
-    let clip_from_world = view
+    let view_from_world = world_from_view.inverse();
+    let unjittered_clip_from_world = view
         .clip_from_world
-        .unwrap_or_else(|| view.clip_from_view * world_from_view.inverse());
+        .unwrap_or_else(|| view.clip_from_view * view_from_world);
+    // Rasterize with TAA's sub-pixel jitter, as Bevy's own passes do, so the
+    // history converges to antialiased strands.
+    let clip_from_world = match (view.clip_from_world, jitter) {
+        (None, Some(jitter)) => {
+            let mut clip_from_view = view.clip_from_view;
+            jitter.jitter_projection(&mut clip_from_view, Vec2::new(width as f32, height as f32));
+            clip_from_view * view_from_world
+        }
+        _ => unjittered_clip_from_world,
+    };
+    let previous_clip_from_world = previous_view.map_or(unjittered_clip_from_world, |previous| {
+        previous.unjittered_clip_from_world
+    });
+    let motion_vectors = prepass.and_then(|prepass| prepass.motion_vectors.as_ref());
     let world_from_clip = clip_from_world.inverse();
     let reverse = depth_is_reverse(clip_from_world, camera_pos, forward);
 
@@ -399,6 +423,7 @@ pub fn hair_pass(
         &mut state,
         color_format,
         depth_format,
+        motion_vectors.map(|motion| motion.texture.texture.format()),
         reverse,
     );
     let Some(composite) = cache.get_render_pipeline(composite_id) else {
@@ -420,6 +445,7 @@ pub fn hair_pass(
     let targets = state.frame.targets.as_ref().unwrap();
     let mut written = state.frame.written_rect;
 
+    let mut composited = false;
     for groom in &extracted.grooms {
         let Some(gpu) = state.grooms.get(&groom.asset) else {
             continue;
@@ -481,6 +507,10 @@ pub fn hair_pass(
             pass_mode: [0, gpu.bundle_count, u32::from(reverse), 0],
             light_eye,
             rect,
+            motion_clip: unjittered_clip_from_world,
+            prev_clip: previous_clip_from_world
+                * groom.previous_world_from_model
+                * groom.world_from_model.inverse(),
         });
         queue.write_buffer(&gpu.camera_params, 0, bytemuck::bytes_of(&camera_params));
 
@@ -640,11 +670,15 @@ pub fn hair_pass(
                 depth_buf.as_entire_binding(),
             )),
         );
-        let color_attachment = [Some(target.get_color_attachment())];
+        let color_attachment = [
+            Some(target.get_color_attachment()),
+            motion_vectors.map(|motion| motion.get_attachment()),
+        ];
+        let color_attachment = &color_attachment[..1 + usize::from(motion_vectors.is_some())];
         let depth_attachment = Some(depth.get_attachment(StoreOp::Store));
         let mut pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
             label: Some("hair_composite"),
-            color_attachments: &color_attachment,
+            color_attachments: color_attachment,
             depth_stencil_attachment: depth_attachment,
             timestamp_writes: None,
             occlusion_query_set: None,
@@ -654,6 +688,20 @@ pub fn hair_pass(
         pass.set_scissor_rect(rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1]);
         pass.set_bind_group(0, &group, &[]);
         pass.draw(0..3, 0..1);
+        drop(pass);
+        composited = true;
+    }
+
+    // Bevy copies the depth prepass into this texture before the main pass,
+    // so it has no hair. TAA picks each pixel's motion vector from the
+    // nearest of five taps in it; refresh it so hair edges take the hair's
+    // motion. WebGPU copies depth textures only whole.
+    if composited && let Some(prepass_depth) = prepass.and_then(|prepass| prepass.depth.as_ref()) {
+        ctx.command_encoder().copy_texture_to_texture(
+            depth.texture().as_image_copy(),
+            prepass_depth.texture.texture.as_image_copy(),
+            prepass_depth.texture.texture.size(),
+        );
     }
 
     state.frame.written_rect = written;
@@ -696,6 +744,8 @@ struct ViewArgs<'a> {
     pass_mode: [u32; 4],
     light_eye: Vec3,
     rect: [u32; 4],
+    motion_clip: Mat4,
+    prev_clip: Mat4,
 }
 
 fn make_params(args: ViewArgs) -> HairParams {
@@ -744,6 +794,8 @@ fn make_params(args: ViewArgs) -> HairParams {
             args.dom_far,
         ],
         rect: args.rect,
+        motion_clip: args.motion_clip.to_cols_array_2d(),
+        prev_clip: args.prev_clip.to_cols_array_2d(),
     }
 }
 
@@ -1028,6 +1080,8 @@ fn render_dom(
         pass_mode: [1, gpu.bundle_count, u32::from(reverse), 1],
         light_eye: fit.eye,
         rect: [0, 0, DOM_SIZE, DOM_SIZE],
+        motion_clip: Mat4::IDENTITY,
+        prev_clip: Mat4::IDENTITY,
     });
     let mut opacity_params = depth_params;
     opacity_params.pass_mode[0] = 2;
@@ -1255,9 +1309,11 @@ fn ensure_composite(
     state: &mut HairPassState,
     format: TextureFormat,
     depth_format: TextureFormat,
+    motion: Option<TextureFormat>,
     reverse: bool,
 ) -> CachedRenderPipelineId {
-    if state.composite_key != Some((format, depth_format)) {
+    let key = (format, depth_format, motion);
+    if state.composite_key != Some(key) {
         state.composite_greater = Some(queue_composite(
             cache,
             pipelines.composite_shader.clone(),
@@ -1265,6 +1321,7 @@ fn ensure_composite(
             format,
             depth_format,
             CompareFunction::GreaterEqual,
+            motion,
         ));
         state.composite_less = Some(queue_composite(
             cache,
@@ -1273,8 +1330,9 @@ fn ensure_composite(
             format,
             depth_format,
             CompareFunction::LessEqual,
+            motion,
         ));
-        state.composite_key = Some((format, depth_format));
+        state.composite_key = Some(key);
     }
     if reverse {
         state.composite_greater.unwrap()

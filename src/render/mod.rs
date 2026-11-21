@@ -93,6 +93,9 @@ pub(crate) struct ExtractedFrame {
 pub(crate) struct ExtractedGroom {
     asset: AssetId<HairMesh>,
     world_from_model: Mat4,
+    /// Last frame's transform, for motion vectors. Equal to `world_from_model`
+    /// on the groom's first frame.
+    previous_world_from_model: Mat4,
     lambda: f32,
     albedo: Vec4,
     roughness: f32,
@@ -118,6 +121,13 @@ pub(crate) struct ExtractedPositional {
     channel: u8,
 }
 
+type GroomItem = (
+    Entity,
+    &'static HairGroom,
+    &'static GlobalTransform,
+    Option<&'static Visibility>,
+);
+
 type DirectionalCaster = (
     &'static DirectionalLight,
     &'static GlobalTransform,
@@ -139,16 +149,19 @@ fn valid_channel(channel: Option<&MaterialShadowChannel>) -> Option<u8> {
 }
 
 fn extract_hair(
-    grooms: Extract<Query<(&HairGroom, &GlobalTransform, Option<&Visibility>)>>,
+    grooms: Extract<Query<GroomItem>>,
     lights: Extract<Query<DirectionalCaster>>,
     positionals: Extract<Query<PositionalCaster, PositionalLight>>,
     meshes: Extract<Res<Assets<HairMesh>>>,
     mut extracted: ResMut<ExtractedFrame>,
+    mut previous: Local<HashMap<Entity, Mat4>>,
+    mut current: Local<HashMap<Entity, Mat4>>,
 ) {
     extracted.grooms.clear();
     extracted.directionals.clear();
     extracted.positionals.clear();
-    for (groom, transform, visibility) in &grooms {
+    current.clear();
+    for (entity, groom, transform, visibility) in &grooms {
         if visibility.is_some_and(|visibility| *visibility == Visibility::Hidden) {
             continue;
         }
@@ -158,9 +171,12 @@ fn extract_hair(
         let id = groom.mesh.id();
         extracted.meshes.entry(id).or_insert_with(|| mesh.clone());
         let linear = groom.albedo.to_linear();
+        let world_from_model = transform.to_matrix();
+        current.insert(entity, world_from_model);
         extracted.grooms.push(ExtractedGroom {
             asset: id,
-            world_from_model: transform.to_matrix(),
+            world_from_model,
+            previous_world_from_model: previous.get(&entity).copied().unwrap_or(world_from_model),
             lambda: groom.lambda,
             albedo: Vec4::new(linear.red, linear.green, linear.blue, 1.0),
             roughness: groom.roughness,
@@ -175,6 +191,7 @@ fn extract_hair(
             fiber_width: groom.fiber_width,
         });
     }
+    std::mem::swap(&mut *previous, &mut *current);
     for (light, transform, channel) in &lights {
         extracted.directionals.push(ExtractedDirectional {
             direction_to_light: transform.back().as_vec3(),

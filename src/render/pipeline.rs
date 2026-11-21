@@ -11,7 +11,7 @@ use crate::render::pass::{SHADOW_CHANNELS, SHADOW_LIGHT_BYTES};
 const COMMON: &str = include_str!("shaders/common.wgsl");
 
 /// `HairParams` uniform size. Keep in sync with `shaders/common.wgsl`.
-pub const HAIR_PARAMS_SIZE: u64 = 464;
+pub const HAIR_PARAMS_SIZE: u64 = 592;
 
 #[derive(Resource, Clone)]
 pub struct HairShaderHandles {
@@ -317,7 +317,20 @@ pub fn queue_composite(
     format: TextureFormat,
     depth_format: TextureFormat,
     compare: CompareFunction,
+    motion: Option<TextureFormat>,
 ) -> CachedRenderPipelineId {
+    let mut targets = vec![Some(ColorTargetState {
+        format,
+        blend: Some(BlendState::ALPHA_BLENDING),
+        write_mask: ColorWrites::ALL,
+    })];
+    targets.extend(motion.map(|format| {
+        Some(ColorTargetState {
+            format,
+            blend: None,
+            write_mask: ColorWrites::ALL,
+        })
+    }));
     cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some("hair_composite".into()),
         layout: vec![layout.clone()],
@@ -330,13 +343,9 @@ pub fn queue_composite(
         },
         fragment: Some(FragmentState {
             shader,
-            entry_point: Some("fs".into()),
+            entry_point: Some(if motion.is_some() { "fs_motion" } else { "fs" }.into()),
             shader_defs: Vec::new(),
-            targets: vec![Some(ColorTargetState {
-                format,
-                blend: Some(BlendState::ALPHA_BLENDING),
-                write_mask: ColorWrites::ALL,
-            })],
+            targets,
             ..default()
         }),
         primitive: PrimitiveState::default(),
