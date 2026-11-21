@@ -226,6 +226,22 @@ fn dual_scatter(cos_theta_d: f32, sigma_a: vec3<f32>, shape: Shape) -> DualScatt
     return DualScatter(fwd, a_f, alpha_f, beta_f2, a_back, delta_b, sigma_b * sigma_b);
 }
 
+// Shading terms that depend only on the fiber and the view, shared by direct
+// and environment lighting.
+struct Fiber {
+    shape: Shape,
+    sigma_a: vec3<f32>,
+    ds: DualScatter,
+}
+
+fn fiber_terms(tangent: vec3<f32>, view: vec3<f32>, albedo: vec3<f32>, roughness: f32, tilt: f32) -> Fiber {
+    let shape = lobe_shape(roughness, tilt);
+    // θd of the specular cone, where θi = -θo.
+    let cos_theta_o = sqrt(max(1.0 - dot(tangent, view) * dot(tangent, view), 1e-6));
+    let sigma_a = absorption_from_color(albedo, roughness);
+    return Fiber(shape, sigma_a, dual_scatter(cos_theta_o, sigma_a, shape));
+}
+
 // `depth` is the optical depth of hair toward the light. Zero when unknown.
 fn hair_bsdf(
     tangent: vec3<f32>,
@@ -452,6 +468,29 @@ fn sample_environment(spec_dir: vec3<f32>, diff_dir: vec3<f32>, roughness: f32) 
     return EnvSample(spec, diff);
 }
 
+@if(ENVIRONMENT_MAP && MULTIPLE_LIGHT_PROBES_IN_ARRAY)
+fn sample_specular(dir: vec3<f32>, roughness: f32) -> vec3<f32> {
+    let index = u32(view_bindings::light_probes.view_cubemap_index);
+    let last_mip = f32(textureNumLevels(view_bindings::specular_environment_maps[index]) - 1u);
+    return textureSampleLevel(
+        view_bindings::specular_environment_maps[index],
+        view_bindings::environment_map_sampler,
+        dir,
+        roughness * last_mip,
+    ).rgb;
+}
+
+@if(ENVIRONMENT_MAP && !MULTIPLE_LIGHT_PROBES_IN_ARRAY)
+fn sample_specular(dir: vec3<f32>, roughness: f32) -> vec3<f32> {
+    let last_mip = f32(view_bindings::light_probes.smallest_specular_mip_level_for_view);
+    return textureSampleLevel(
+        view_bindings::specular_environment_map,
+        view_bindings::environment_map_sampler,
+        dir,
+        roughness * last_mip,
+    ).rgb;
+}
+
 @if(ENVIRONMENT_MAP && !MULTIPLE_LIGHT_PROBES_IN_ARRAY)
 fn sample_environment(spec_dir: vec3<f32>, diff_dir: vec3<f32>, roughness: f32) -> EnvSample {
     let last_mip = f32(view_bindings::light_probes.smallest_specular_mip_level_for_view);
@@ -478,7 +517,7 @@ fn probe_radiance(
     view: vec3<f32>,
     albedo: vec3<f32>,
     roughness: f32,
-    tilt: f32,
+    fiber: Fiber,
 ) -> vec3<f32> {
     return vec3<f32>(0.0);
 }
@@ -490,14 +529,14 @@ fn probe_radiance(
     view: vec3<f32>,
     albedo: vec3<f32>,
     roughness: f32,
-    tilt: f32,
+    fiber: Fiber,
 ) -> vec3<f32> {
     if view_bindings::light_probes.view_cubemap_index < 0 {
         return vec3<f32>(0.0);
     }
     // The R cone sits at θi = tilt - θo. Sample its line facing the camera.
     let theta_o = asin(clamp(dot(tangent, view), -1.0, 1.0));
-    let theta_i = tilt - theta_o;
+    let theta_i = fiber.shape.alpha.x - theta_o;
     let env = sample_environment(
         cubemap_dir(tangent * sin(theta_i) + fiber_n * cos(theta_i)),
         cubemap_dir(fiber_n),
@@ -505,15 +544,21 @@ fn probe_radiance(
     );
     // The azimuthal R lobe integrates to one, so R is the Fresnel-weighted
     // prefiltered radiance. TRT shares the lookup and adds its absorption.
-    // TT from behind is mostly blocked by the head and is left to scattering.
     let cos_o = max(cos(theta_o), 1e-3);
     let f_r = fresnel(cos_o);
     let f_trt = fresnel(cos_o * 0.5);
-    let sigma_a = absorption_from_color(albedo, roughness);
-    let trt = 0.76 * (1.0 - f_trt) * (1.0 - f_trt) * f_trt * exp(-sigma_a * 3.2 / cos_o);
+    let trt = 0.76 * (1.0 - f_trt) * (1.0 - f_trt) * f_trt * exp(-fiber.sigma_a * 3.2 / cos_o);
+    // TT looks through the fiber: its cone at θi = α_TT - θo on the far side,
+    // weighted by the forward TT energy over azimuth. The head and the hair
+    // between are left to the baked occlusion the caller applies. Its lobe is
+    // half as wide as R's, so it reads a sharper mip.
+    let theta_tt = fiber.shape.alpha.y - theta_o;
+    let tt_dir = tangent * sin(theta_tt) - fiber_n * cos(theta_tt);
+    let tt = sample_specular(cubemap_dir(tt_dir), roughness * 0.7071) * fiber.ds.fwd.tt;
     // The diffuse cubemap is already cosine-weighted irradiance over π.
     let scatter = albedo * scatter_tint(albedo, 0.5);
-    return (env.spec * (f_r + trt) + env.diff * scatter) * view_bindings::light_probes.intensity_for_view;
+    return (env.spec * (f_r + trt) + tt + env.diff * scatter)
+        * view_bindings::light_probes.intensity_for_view;
 }
 
 fn direct_light(
@@ -521,19 +566,15 @@ fn direct_light(
     tangent: vec3<f32>,
     view: vec3<f32>,
     fiber_n: vec3<f32>,
-    albedo: vec3<f32>,
-    roughness: f32,
-    tilt: f32,
+    fiber: Fiber,
     beta: f32,
     frag_xy: vec2<f32>,
     view_z: f32,
     ortho: bool,
 ) -> vec3<f32> {
-    let shape = lobe_shape(roughness, tilt);
-    // θd of the specular cone, where θi = -θo.
-    let cos_theta_o = sqrt(max(1.0 - dot(tangent, view) * dot(tangent, view), 1e-6));
-    let sigma_a = absorption_from_color(albedo, roughness);
-    let ds = dual_scatter(cos_theta_o, sigma_a, shape);
+    let shape = fiber.shape;
+    let sigma_a = fiber.sigma_a;
+    let ds = fiber.ds;
     let world_h = vec4<f32>(world, 1.0);
     let cluster_index = clustering::view_fragment_cluster_index(frag_xy, view_z, ortho);
     let ranges = clustering::unpack_clusterable_object_index_ranges(cluster_index);
@@ -674,20 +715,19 @@ fn fs(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     }
     let fiber_n = safe_normalize(view - tangent * dot(view, tangent));
 
+    let fiber = fiber_terms(tangent, view, albedo, roughness, tilt);
     var color = direct_light(
         world,
         tangent,
         view,
         fiber_n,
-        albedo,
-        roughness,
-        tilt,
+        fiber,
         beta,
         in.position.xy,
         view_z,
         ortho,
     );
-    color += probe_radiance(tangent, fiber_n, view, albedo, roughness, tilt) * ao;
+    color += probe_radiance(tangent, fiber_n, view, albedo, roughness, fiber) * ao;
     // The mesh pipeline scales physical radiance by exposure before the HDR target.
     color *= view_bindings::view.exposure;
 
