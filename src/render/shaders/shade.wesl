@@ -50,7 +50,7 @@ fn vs(@builtin(vertex_index) vertex_index: u32) -> FullscreenVertexOutput {
 const DENSITY_FRONT: f32 = 0.7;
 const DENSITY_BACK: f32 = 0.7;
 // Azimuthal samples per quarter turn for the attenuation integrals.
-const SCATTER_STEPS: u32 = 8u;
+const SCATTER_STEPS: u32 = 4u;
 
 fn gaussian(b: f32, x: f32) -> f32 {
     return exp(-0.5 * x * x / (b * b)) / (sqrt(2.0 * PI) * b);
@@ -148,29 +148,58 @@ struct DualScatter {
     sigma_b2: vec3<f32>,
 }
 
-fn sum_lobes(a: Lobes, b: Lobes) -> Lobes {
-    return Lobes(a.r + b.r, a.tt + b.tt, a.trt + b.trt);
-}
-
 // Energy-weighted mean of a per-lobe quantity.
 fn lobe_mean(l: Lobes, total: vec3<f32>, q: vec3<f32>) -> vec3<f32> {
     return (l.r * q.x + l.tt * q.y + l.trt * q.z) / max(total, vec3<f32>(1e-5));
 }
 
+// One azimuthal sample of `azimuthal` with its φ-independent factors pulled
+// out: R is gray, and TRT's Fresnel and absorption are applied after the sum.
+struct AzimuthSample {
+    r: f32,
+    tt: vec3<f32>,
+    trt: f32,
+}
+
+fn azimuth_sample(cos_theta_d: f32, a: f32, tt_k: vec3<f32>, cos_phi: f32) -> AzimuthSample {
+    let cos_half_phi = sqrt(clamp(0.5 + 0.5 * cos_phi, 0.0, 1.0));
+    let n_r = 0.25 * cos_half_phi * fresnel(cos_theta_d * cos_half_phi);
+    let h = cos_half_phi * (1.0 + a * (0.6 - 0.8 * cos_phi));
+    let f_tt = fresnel(cos_theta_d * sqrt(clamp(1.0 - h * h, 0.0, 1.0)));
+    let t_tt = exp(tt_k * sqrt(clamp(1.0 - h * h * a * a, 0.0, 1.0)));
+    let n_tt = exp(-3.65 * cos_phi - 3.98) * (1.0 - f_tt) * (1.0 - f_tt) * t_tt;
+    return AzimuthSample(n_r, n_tt, exp(17.0 * cos_phi - 16.78));
+}
+
 // The paper tabulates these over θ. Evaluating at the view's θ needs no table.
 fn dual_scatter(cos_theta_d: f32, sigma_a: vec3<f32>, shape: Shape) -> DualScatter {
-    let zero = vec3<f32>(0.0);
-    var fwd = Lobes(zero, zero, zero);
-    var back = Lobes(zero, zero, zero);
+    // The parts of `azimuthal` that don't vary with φ.
+    let a = 1.0 / (1.19 / cos_theta_d + 0.36 * cos_theta_d);
+    let tt_k = -sigma_a * 2.0 / cos_theta_d;
+    let f_trt = fresnel(cos_theta_d * 0.5);
+    let trt_scale = (1.0 - f_trt) * (1.0 - f_trt) * f_trt * exp(-sigma_a * 3.2 / cos_theta_d);
+
+    var back_r = 0.0;
+    var fwd_r = 0.0;
+    var back_trt = 0.0;
+    var fwd_trt = 0.0;
+    var back_tt = vec3<f32>(0.0);
+    var fwd_tt = vec3<f32>(0.0);
     for (var i = 0u; i < SCATTER_STEPS; i++) {
         let u = (f32(i) + 0.5) / f32(SCATTER_STEPS);
-        back = sum_lobes(back, azimuthal(cos_theta_d, cos(u * 0.5 * PI), sigma_a));
-        fwd = sum_lobes(fwd, azimuthal(cos_theta_d, cos((1.0 + u) * 0.5 * PI), sigma_a));
+        let b = azimuth_sample(cos_theta_d, a, tt_k, cos(u * 0.5 * PI));
+        let f = azimuth_sample(cos_theta_d, a, tt_k, cos((1.0 + u) * 0.5 * PI));
+        back_r += b.r;
+        back_tt += b.tt;
+        back_trt += b.trt;
+        fwd_r += f.r;
+        fwd_tt += f.tt;
+        fwd_trt += f.trt;
     }
     // Midpoint rule over a quarter turn, doubled for the mirrored side.
     let w = PI / f32(SCATTER_STEPS);
-    fwd = Lobes(fwd.r * w, fwd.tt * w, fwd.trt * w);
-    back = Lobes(back.r * w, back.tt * w, back.trt * w);
+    let fwd = Lobes(vec3<f32>(fwd_r * w), fwd_tt * w, trt_scale * (fwd_trt * w));
+    let back = Lobes(vec3<f32>(back_r * w), back_tt * w, trt_scale * (back_trt * w));
 
     let a_f = min(fwd.r + fwd.tt + fwd.trt, vec3<f32>(0.95));
     let a_b = back.r + back.tt + back.trt;

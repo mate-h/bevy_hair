@@ -10,21 +10,28 @@
 //! Baked meshes are reused from `target/groom-cache/` until the hair file, the
 //! scalp, or the baker changes. `cargo run --example bake` fills that cache
 //! without opening a window.
+//!
+//! `HAIR_HEADLESS=1` (implied by `HAIR_SCREENSHOT`) renders offscreen at
+//! 2560×1440 with no window, so profiling runs never take focus or input.
 
 mod bake;
 
 use std::f32::consts::FRAC_PI_2;
 use std::fmt;
+use std::time::Duration;
 
-use bevy::app::{PluginGroup, RunFixedMainLoop, RunFixedMainLoopSystems};
+use bevy::app::{PluginGroup, RunFixedMainLoop, RunFixedMainLoopSystems, ScheduleRunnerPlugin};
+use bevy::camera::RenderTarget;
 use bevy::camera::Hdr;
 use bevy::light::{CascadeShadowConfigBuilder, MaterialShadowChannel};
 use bevy::log::LogPlugin;
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
 use bevy::render::RenderPlugin;
-use bevy::render::render_resource::{TextureUsages, WgpuFeatures};
+use bevy::render::render_resource::{TextureFormat, TextureUsages, WgpuFeatures};
 use bevy::render::settings::WgpuSettings;
+use bevy::window::ExitCondition;
+use bevy::winit::WinitPlugin;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy_camera_controller::free_camera::{
     FreeCamera, FreeCameraPlugin, run_freecamera_controller,
@@ -40,24 +47,35 @@ fn main() {
         | WgpuFeatures::SHADER_INT64_ATOMIC_MIN_MAX;
 
     let prepared = prepare_assets();
+    let headless = headless();
+
+    let mut plugins = DefaultPlugins
+        .set(RenderPlugin {
+            render_creation: wgpu.into(),
+            ..default()
+        })
+        .set(WindowPlugin {
+            primary_window: (!headless).then(|| Window {
+                title: "bevy_hair".into(),
+                ..default()
+            }),
+            exit_condition: if headless {
+                ExitCondition::DontExit
+            } else {
+                ExitCondition::OnAllClosed
+            },
+            ..default()
+        })
+        .build()
+        .disable::<LogPlugin>();
+    if headless {
+        plugins = plugins
+            .disable::<WinitPlugin>()
+            .add(ScheduleRunnerPlugin::run_loop(Duration::ZERO));
+    }
 
     App::new()
-        .add_plugins(
-            DefaultPlugins
-                .set(RenderPlugin {
-                    render_creation: wgpu.into(),
-                    ..default()
-                })
-                .set(WindowPlugin {
-                    primary_window: Some(Window {
-                        title: "bevy_hair".into(),
-                        ..default()
-                    }),
-                    ..default()
-                })
-                .build()
-                .disable::<LogPlugin>(),
-        )
+        .add_plugins(plugins)
         .add_plugins((HairPlugin, FreeCameraPlugin))
         .insert_resource(ClearColor(Color::srgb(0.04, 0.045, 0.05)))
         .insert_resource(prepared)
@@ -77,6 +95,16 @@ fn main() {
         .run();
 }
 
+/// Render offscreen with no window, so profiling and screenshot runs neither
+/// need to stay frontmost nor take keyboard focus.
+fn headless() -> bool {
+    std::env::var_os("HAIR_HEADLESS").is_some() || std::env::var_os("HAIR_SCREENSHOT").is_some()
+}
+
+/// The camera's image when running headless.
+#[derive(Resource)]
+struct OffscreenTarget(Handle<Image>);
+
 /// `HAIR_SCREENSHOT=<file.png>` saves one frame after `HAIR_SCREENSHOT_SECS`
 /// (default 40, past pipeline compilation) and quits. The default scene is
 /// static, so two runs of one build give the same image.
@@ -85,6 +113,7 @@ fn screenshot_and_exit(
     time: Res<Time<Real>>,
     mut state: Local<Option<f32>>,
     mut exit: MessageWriter<AppExit>,
+    offscreen: Option<Res<OffscreenTarget>>,
 ) {
     let Ok(path) = std::env::var("HAIR_SCREENSHOT") else {
         return;
@@ -97,8 +126,12 @@ fn screenshot_and_exit(
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(40.0);
             if now >= after {
+                let shot = match offscreen {
+                    Some(target) => Screenshot::image(target.0.clone()),
+                    None => Screenshot::primary_window(),
+                };
                 commands
-                    .spawn(Screenshot::primary_window())
+                    .spawn(shot)
                     .observe(save_to_disk(path));
                 *state = Some(now);
             }
@@ -228,8 +261,22 @@ fn setup(
     mut materials: ResMut<Assets<HairShadowMaterial>>,
     hair_shadow: Res<HairShadow>,
     mut hair: ResMut<Assets<HairMesh>>,
+    mut images: ResMut<Assets<Image>>,
     asset_server: Res<AssetServer>,
 ) {
+    // Same size as the default window on a 2x display.
+    let target = if headless() {
+        let image = images.add(Image::new_target_texture(
+            2560,
+            1440,
+            TextureFormat::Rgba8Unorm,
+            Some(TextureFormat::Rgba8UnormSrgb),
+        ));
+        commands.insert_resource(OffscreenTarget(image.clone()));
+        RenderTarget::Image(image.into())
+    } else {
+        RenderTarget::default()
+    };
     let handles = [
         hair.add(std::mem::replace(&mut prepared.grooms[0], empty_groom())),
         hair.add(std::mem::replace(&mut prepared.grooms[1], empty_groom())),
@@ -296,6 +343,7 @@ fn setup(
             fov: 2.0 * (24.0_f32 / (2.0 * 50.0)).atan(),
             ..default()
         }),
+        target,
         Hdr,
         Msaa::Off,
         EnvironmentMapLight {
