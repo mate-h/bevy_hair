@@ -16,9 +16,10 @@ struct SmLayer {
 }
 
 var<workgroup> sm: array<SmLayer, 16>;
-var<workgroup> cp_pos: array<vec4<f32>, 128>;
-var<workgroup> cp_tan: array<vec4<f32>, 128>;
-var<workgroup> cp_uvw: array<vec4<f32>, 128>;
+// Workgroup memory bounds how many workgroups share a core, so this holds
+// only xyz and ao per control point. Tangents come from the neighbors
+// (`cp_tangent`) and uvw from the strand's uv and the point's w (`cp_w`).
+var<workgroup> cp_pos: array<vec4<f32>, MAX_CONTROL_POINTS>;
 
 fn sample_layer(offset: u32, layer: u32, uv: vec2<f32>) -> SmLayer {
     let i = offset + layer * 4u;
@@ -57,8 +58,25 @@ fn sample_style(offset: u32, uv: vec2<f32>, w: f32, level: u32) -> vec3<f32> {
     return r;
 }
 
+fn cp_w(idx: u32, ncp: u32) -> f32 {
+    return f32(idx) / f32(max(ncp - 1u, 1u));
+}
+
+fn cp_tangent(idx: u32, ncp: u32) -> vec3<f32> {
+    let p = cp_pos[idx].xyz;
+    var prev_p = p;
+    var next_p = p;
+    if idx > 0u {
+        prev_p = cp_pos[idx - 1u].xyz;
+    }
+    if idx + 1u < ncp {
+        next_p = cp_pos[idx + 1u].xyz;
+    }
+    return safe_normalize(calc_tangent(idx, ncp, prev_p, p, next_p));
+}
+
 fn eval_cp(idx: u32, ncp: u32, uv: vec2<f32>, style_offset: u32) -> vec4<f32> {
-    let w = f32(idx) / f32(max(ncp - 1u, 1u));
+    let w = cp_w(idx, ncp);
     let layers_f = w * f32(LAYER_COUNT - 1u);
     let i0 = min(u32(floor(layers_f)), LAYER_COUNT - 1u);
     let i1 = min(i0 + 1u, LAYER_COUNT - 1u);
@@ -68,7 +86,6 @@ fn eval_cp(idx: u32, ncp: u32, uv: vec2<f32>, style_offset: u32) -> vec4<f32> {
     let base = hermite(a.pos_ao.xyz, b.pos_ao.xyz, a.tangent.xyz, b.tangent.xyz, t);
     let ao = mix(a.pos_ao.w, b.pos_ao.w, t);
     let residual = sample_style(style_offset, uv, w, style_level_for(ncp));
-    cp_uvw[idx] = vec4<f32>(uv, w, ao);
     return vec4<f32>(base + residual, ao);
 }
 
@@ -284,26 +301,6 @@ fn main(
     }
     workgroupBarrier();
 
-    // Only the G-buffer stores tangents; the opacity passes skip them.
-    for (var k = 0u; k < 4u; k++) {
-        if k >= s || params.pass_mode.x != 0u {
-            break;
-        }
-        let idx = first + k;
-        if idx < ncp {
-            var prev_p = cp_pos[idx].xyz;
-            var next_p = cp_pos[idx].xyz;
-            if idx > 0u {
-                prev_p = cp_pos[idx - 1u].xyz;
-            }
-            if idx + 1u < ncp {
-                next_p = cp_pos[idx + 1u].xyz;
-            }
-            cp_tan[idx] = vec4<f32>(safe_normalize(calc_tangent(idx, ncp, prev_p, cp_pos[idx].xyz, next_p)), 0.0);
-        }
-    }
-    workgroupBarrier();
-
     let beta = f32(strand.n_lod) / f32(max(bundle.strand_count, 1u));
     // Segments go round-robin, so 2^k segments keep every lane busy where the
     // point split above would leave half of them idle. The G-buffer and opacity
@@ -316,9 +313,11 @@ fn main(
             if params.pass_mode.x != 0u {
                 draw_dom_segment(p0, p1, idx == 0u);
             } else {
-                let t0 = dir_world(params, cp_tan[idx].xyz);
-                let t1 = dir_world(params, cp_tan[idx + 1u].xyz);
-                draw_segment(p0, p1, t0, t1, cp_uvw[idx].xyz, cp_uvw[idx + 1u].xyz, cp_uvw[idx].w, cp_uvw[idx + 1u].w, beta);
+                let t0 = dir_world(params, cp_tangent(idx, ncp));
+                let t1 = dir_world(params, cp_tangent(idx + 1u, ncp));
+                let uvw0 = vec3<f32>(uv, cp_w(idx, ncp));
+                let uvw1 = vec3<f32>(uv, cp_w(idx + 1u, ncp));
+                draw_segment(p0, p1, t0, t1, uvw0, uvw1, cp_pos[idx].w, cp_pos[idx + 1u].w, beta);
             }
         }
     }
