@@ -22,12 +22,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let thickness = max(far - near, 1e-3) / f32(DOM_LAYERS);
     let extinction = params.filter_params.w;
     let perspective = params.light_forward.w > 0.5;
-    let base = pixels + pix * DOM_LAYERS;
+    // Slice `s` of texel `pix` is word `pixels * (s + 1) + pix`.
     var occ = 0.0;
     for (var slice = 0u; slice < DOM_LAYERS; slice++) {
         let z = z_front + (f32(slice) + 0.5) * thickness;
         let e = select(extinction, extinction / max(z, 1e-3), perspective);
-        occ += f32(dom[base + slice]) * e;
-        dom[base + slice] = bitcast<u32>(occ);
+        let i = pixels * (slice + 1u) + pix;
+        occ += f32(dom[i]) * e;
+        dom[i] = bitcast<u32>(occ);
     }
 }

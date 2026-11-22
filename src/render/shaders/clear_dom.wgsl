@@ -11,7 +11,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if i >= arrayLength(&dom) {
         return;
     }
-    // Texels first, then one opacity count per layer. Empty depth is the
+    // Texels first, then one plane of opacity counts per slice. Empty depth is the
     // atomicMin identity so an unwritten texel stays "no hair".
     if i < DOM_PIXELS {
         dom[i] = 0xffffffffu;

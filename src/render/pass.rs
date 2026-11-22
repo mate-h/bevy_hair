@@ -28,7 +28,8 @@ pub const DOM_LAYERS: u32 = 16;
 /// Fixed-point units per light-map pixel of projected strand length in the
 /// opacity slices. Keep in sync with `DOM_COVERAGE` in the shaders.
 pub const DOM_COVERAGE: f32 = 256.0;
-/// Front depth texels, then `DOM_LAYERS` opacity counts per texel.
+/// Front depth texels, then one plane of opacity counts per slice, so slice
+/// `s` of texel `p` is word `pixels * (s + 1) + p`.
 pub const DOM_BYTES: u64 = (DOM_SIZE * DOM_SIZE * (1 + DOM_LAYERS)) as u64 * 4;
 pub const SHADOW_LIGHT_BYTES: u64 = size_of::<ShadowLight>() as u64;
 

@@ -176,7 +176,8 @@ fn write_dom_pixel(pixel: vec2<i32>, world: vec3<f32>, coverage: u32) {
     let t = max(dist - z_front, 0.0) / thickness;
     let slice = min(u32(t), DOM_LAYERS - 1u);
     let pixels = dom_w * u32(params.dom_info.y);
-    atomicAdd(&dom[pixels + pix * DOM_LAYERS + slice], coverage);
+    // Slice-major, so neighboring texels of one slice share cache lines.
+    atomicAdd(&dom[pixels * (slice + 1u) + pix], coverage);
 }
 
 fn draw_dom_segment(p0: vec3<f32>, p1: vec3<f32>, include_start: bool) {

@@ -53,17 +53,18 @@ fn texel_visibility(channel: u32, x: i32, y: i32, dist: f32) -> f32 {
     let t = max(dist - z_front, 0.0) / thickness;
     // Slices hold the running optical depth through their far edge
     // (`dom_prefix.wgsl`).
-    let base = map + DOM_SIZE * DOM_SIZE + pix * DOM_LAYERS;
+    // Slice `s` of texel `pix` is word `pixels * (s + 1) + pix`.
+    let pixels = DOM_SIZE * DOM_SIZE;
     var occ: f32;
     if t >= f32(DOM_LAYERS) {
-        occ = bitcast<f32>(hair_dom[base + DOM_LAYERS - 1u]);
+        occ = bitcast<f32>(hair_dom[map + pixels * DOM_LAYERS + pix]);
     } else {
         let slice = u32(t);
         var before = 0.0;
         if slice > 0u {
-            before = bitcast<f32>(hair_dom[base + slice - 1u]);
+            before = bitcast<f32>(hair_dom[map + pixels * slice + pix]);
         }
-        occ = mix(before, bitcast<f32>(hair_dom[base + slice]), t - f32(slice));
+        occ = mix(before, bitcast<f32>(hair_dom[map + pixels * (slice + 1u) + pix]), t - f32(slice));
     }
     return exp(-occ);
 }

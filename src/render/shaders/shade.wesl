@@ -344,15 +344,15 @@ fn dom_word(view: DomView, i: u32) -> u32 {
 // (`dom_prefix.wgsl`), so this interpolates between two words.
 fn dom_optical_depth(view: DomView, pix: u32, t: f32) -> f32 {
     let pixels = u32(params.dom_info.x) * u32(params.dom_info.y);
-    let base = pixels + pix * DOM_LAYERS;
+    // Slice `s` of texel `pix` is word `pixels * (s + 1) + pix`.
     if t >= f32(DOM_LAYERS) {
-        return bitcast<f32>(dom_word(view, base + DOM_LAYERS - 1u));
+        return bitcast<f32>(dom_word(view, pixels * DOM_LAYERS + pix));
     }
     let slice = u32(t);
-    let after = bitcast<f32>(dom_word(view, base + slice));
+    let after = bitcast<f32>(dom_word(view, pixels * (slice + 1u) + pix));
     var before = 0.0;
     if slice > 0u {
-        before = bitcast<f32>(dom_word(view, base + slice - 1u));
+        before = bitcast<f32>(dom_word(view, pixels * slice + pix));
     }
     return mix(before, after, t - f32(slice));
 }
